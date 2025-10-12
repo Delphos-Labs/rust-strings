@@ -16,9 +16,9 @@ struct Opts {
     /// min length of string
     #[clap(short, long, default_value = "3")]
     min_length: usize,
-    /// encoding of string
-    #[clap(short, long, default_value = "ascii")]
-    encoding: String,
+    /// encoding of string (ascii, utf16le, utf16be). If not specified, extracts both ascii and utf16le
+    #[clap(short, long)]
+    encoding: Option<String>,
     #[clap(short, long)]
     offset: bool,
 }
@@ -40,31 +40,40 @@ fn get_file_path(options: &Opts) -> String {
 
 fn main() {
     let options = Opts::parse();
-    let encoding = match Encoding::from_str(&options.encoding) {
-        Ok(encoding) => encoding,
-        Err(err) => {
-            eprintln!("{}", err);
-            exit(1);
-        }
-    };
     let file_path = get_file_path(&options);
     let extracted_strings = match file_path == "-" {
-        true => strings(
-            &StdinConfig::new()
-                .with_min_length(options.min_length)
-                .with_encoding(encoding),
-        ),
+        true => {
+            let mut config = StdinConfig::new().with_min_length(options.min_length);
+            if let Some(encoding_str) = &options.encoding {
+                let encoding = match Encoding::from_str(encoding_str) {
+                    Ok(encoding) => encoding,
+                    Err(err) => {
+                        eprintln!("{}", err);
+                        exit(1);
+                    }
+                };
+                config = config.with_encoding(encoding);
+            }
+            strings(&config)
+        }
         false => {
             let path: &Path = Path::new(&file_path);
             if !path.is_file() {
                 eprintln!("File does not exists!");
                 exit(1);
             }
-            strings(
-                &FileConfig::new(path)
-                    .with_min_length(options.min_length)
-                    .with_encoding(encoding),
-            )
+            let mut config = FileConfig::new(path).with_min_length(options.min_length);
+            if let Some(encoding_str) = &options.encoding {
+                let encoding = match Encoding::from_str(encoding_str) {
+                    Ok(encoding) => encoding,
+                    Err(err) => {
+                        eprintln!("{}", err);
+                        exit(1);
+                    }
+                };
+                config = config.with_encoding(encoding);
+            }
+            strings(&config)
         }
     }
     .expect("Something went wrong!");

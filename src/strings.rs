@@ -13,7 +13,7 @@ use crate::strings_writer::{JsonWriter, StringWriter, VectorWriter};
 use crate::ErrorResult;
 
 const DEFAULT_MIN_LENGTH: usize = 3;
-const DEFAULT_ENCODINGS: [Encoding; 1] = [Encoding::ASCII];
+const DEFAULT_ENCODINGS: [Encoding; 2] = [Encoding::ASCII, Encoding::UTF16LE];
 
 pub trait Config {
     #[doc(hidden)]

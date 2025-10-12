@@ -1,0 +1,4 @@
+[build]
+# Force cross to use Docker/Podman for all builds
+[target.x86_64-unknown-linux-gnu]
+[target.aarch64-unknown-linux-gnu]
