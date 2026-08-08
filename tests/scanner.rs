@@ -5,7 +5,7 @@ use std::io::{self, Read};
 
 use rust_strings::{
     scan, Encoding, HitFinish, HitId, HitStart, ScanError, ScanOptions, ScanOptionsError,
-    SinkControl, StringSink,
+    ScanSummary, SinkControl, StringSink,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -465,7 +465,7 @@ fn odd_aligned_utf16_wins_over_shifted_artifacts() {
 enum Event {
     Start(u64, Encoding, u64),
     Chunk(u64, String),
-    Finish(u64),
+    Finish(u64, u64, u64, u64),
     Abort(u64),
 }
 
@@ -486,8 +486,13 @@ impl StringSink for EventSink {
         Ok(SinkControl::Continue)
     }
 
-    fn finish(&mut self, id: HitId, _finish: HitFinish) -> Result<(), Self::Error> {
-        self.0.push(Event::Finish(id.get()));
+    fn finish(&mut self, id: HitId, finish: HitFinish) -> Result<(), Self::Error> {
+        self.0.push(Event::Finish(
+            id.get(),
+            finish.source_length.get(),
+            finish.character_count,
+            finish.decoded_utf8_length,
+        ));
         Ok(())
     }
 
@@ -518,10 +523,105 @@ fn overlap_events_follow_decoder_and_terminal_precedence_order() {
             Event::Start(1, Encoding::UTF16LE, 0),
             Event::Chunk(1, "䉁䑃".into()),
             Event::Abort(1),
-            Event::Finish(0),
+            Event::Finish(0, 4, 4, 4),
             Event::Start(2, Encoding::UTF16LE, 1),
             Event::Chunk(2, "䍂D".into()),
             Event::Abort(2),
         ]
     );
+}
+
+fn event_stream<R: Read>(mut reader: R, scan_options: &ScanOptions) -> (Vec<Event>, ScanSummary) {
+    let mut sink = EventSink::default();
+    let summary = scan(&mut reader, scan_options, &mut sink).unwrap();
+    (sink.0, summary)
+}
+
+#[test]
+fn ambiguous_non_ascii_overlaps_are_retained_with_ground_truth_order() {
+    let bytes = [0x01, 0x4e, 0x02, 0x4e, 0x03, 0x4e, 0x00, 0x00];
+    let scan_options = options(3, &[Encoding::UTF16LE]);
+    let (events, summary) = event_stream(bytes.as_slice(), &scan_options);
+    let repeated = event_stream(bytes.as_slice(), &scan_options);
+
+    assert_eq!(repeated, (events.clone(), summary));
+
+    assert_eq!(
+        events,
+        vec![
+            Event::Start(0, Encoding::UTF16LE, 0),
+            Event::Chunk(0, "\u{4e01}\u{4e02}\u{4e03}".into()),
+            Event::Start(1, Encoding::UTF16LE, 1),
+            Event::Chunk(1, "\u{024e}\u{034e}N".into()),
+            Event::Finish(0, 6, 3, 9),
+            Event::Finish(1, 6, 3, 5),
+        ]
+    );
+    assert_eq!(summary.candidate_count, 2);
+    assert_eq!(summary.suppressed_candidate_count, 0);
+}
+
+#[test]
+fn short_reads_match_the_complete_one_shot_event_stream() {
+    let mut bytes = b"ASCII evidence\0".to_vec();
+    bytes.extend(utf16("odd é😀", false, 1));
+    bytes.extend([0xd8, 0x00, b'O', 0, b'K', 0, 0, 0]);
+    let scan_options = options(2, &[Encoding::ASCII, Encoding::UTF16LE, Encoding::UTF16BE]);
+    let expected = event_stream(bytes.as_slice(), &scan_options);
+
+    let actual = event_stream(
+        ShortReader {
+            bytes: &bytes,
+            chunk_size: 1,
+        },
+        &scan_options,
+    );
+    assert_eq!(actual, expected);
+}
+
+struct PatternReader<'a> {
+    bytes: &'a [u8],
+    pattern: &'a [usize],
+    next: usize,
+}
+
+impl Read for PatternReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.bytes.is_empty() {
+            return Ok(0);
+        }
+        let requested = self.pattern[self.next % self.pattern.len()];
+        self.next += 1;
+        let length = requested.min(self.bytes.len()).min(buffer.len());
+        buffer[..length].copy_from_slice(&self.bytes[..length]);
+        self.bytes = &self.bytes[length..];
+        Ok(length)
+    }
+}
+
+#[test]
+fn deterministic_property_chunking_preserves_all_events() {
+    let scan_options = options(3, &[Encoding::ASCII, Encoding::UTF16LE, Encoding::UTF16BE]);
+    for seed in 0_u64..32 {
+        let mut state = seed + 1;
+        let bytes = (0..257)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                (state >> 32) as u8
+            })
+            .collect::<Vec<_>>();
+        let pattern = [1, (seed as usize % 7) + 1, (seed as usize % 17) + 1, 3, 29];
+        let expected = event_stream(bytes.as_slice(), &scan_options);
+        let actual = event_stream(
+            PatternReader {
+                bytes: &bytes,
+                pattern: &pattern,
+                next: 0,
+            },
+            &scan_options,
+        );
+        assert_eq!(actual, expected, "seed {seed}");
+    }
 }

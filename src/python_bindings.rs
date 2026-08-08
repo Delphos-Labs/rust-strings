@@ -7,11 +7,45 @@ use std::str::FromStr;
 use crate::encodings::EncodingNotFoundError;
 use crate::{
     dump_strings as r_dump_strings, strings as r_strings, BytesConfig as RustBytesConfig,
-    Encoding as RustEncoding, FileConfig as RustFileConfig,
+    Encoding as RustEncoding, FileConfig as RustFileConfig, StringHit as RustStringHit,
 };
 
 create_exception!(pystrings, StringsException, PyException);
 create_exception!(pystrings, EncodingNotFoundException, StringsException);
+
+#[pyclass(name = "StringHit", frozen, module = "rust_strings")]
+struct PyStringHit {
+    #[pyo3(get)]
+    text: String,
+    #[pyo3(get)]
+    source_offset: u64,
+    #[pyo3(get)]
+    source_byte_length: u64,
+    #[pyo3(get)]
+    encoding: String,
+    #[pyo3(get)]
+    character_count: u64,
+    #[pyo3(get)]
+    decoded_utf8_length: u64,
+}
+
+impl From<RustStringHit> for PyStringHit {
+    fn from(hit: RustStringHit) -> Self {
+        let encoding = match hit.start.encoding {
+            RustEncoding::ASCII => "ascii",
+            RustEncoding::UTF16LE => "utf-16le",
+            RustEncoding::UTF16BE => "utf-16be",
+        };
+        Self {
+            text: hit.text,
+            source_offset: hit.start.offset.get(),
+            source_byte_length: hit.finish.source_length.get(),
+            encoding: encoding.to_owned(),
+            character_count: hit.finish.character_count,
+            decoded_utf8_length: hit.finish.decoded_utf8_length,
+        }
+    }
+}
 
 impl From<EncodingNotFoundError> for PyErr {
     fn from(err: EncodingNotFoundError) -> PyErr {
@@ -25,7 +59,7 @@ impl From<EncodingNotFoundError> for PyErr {
 /// :param min_length: strings minimum length
 /// :param encoding: strings encoding (default is ["ascii"])
 /// :param buffer_size: the buffer size to read the file (relevant only to file_path option)
-/// :return: list of tuples of string and offset
+/// :return: list of typed string hits with source and decoded metadata
 /// :raises: raise StringsException if there is any error during string extraction
 ///          raise EncodingNotFoundException if the function got an unsupported encondings
 #[pyfunction()]
@@ -37,7 +71,7 @@ impl From<EncodingNotFoundError> for PyErr {
     buffer_size = 1024 * 1024
 ))]
 #[pyo3(
-    text_signature = "(file_path: Optional[Union[str, Path]] = None, bytes: Optional[bytes] = None, min_length: int = 3, encoding: List[str] = [\"ascii\"], buffer_size: int = 1024 * 1024) -> List[Tuple[str, int]]"
+    text_signature = "(file_path: Optional[Union[str, Path]] = None, bytes: Optional[bytes] = None, min_length: int = 3, encoding: List[str] = [\"ascii\"], buffer_size: int = 1024 * 1024) -> List[StringHit]"
 )]
 fn strings(
     py: Python<'_>,
@@ -46,7 +80,7 @@ fn strings(
     min_length: usize,
     encodings: Vec<&str>,
     buffer_size: usize,
-) -> PyResult<Vec<(String, u64)>> {
+) -> PyResult<Vec<PyStringHit>> {
     py.allow_threads(|| {
         if file_path.is_some() && bytes.is_some() {
             return Err(StringsException::new_err(
@@ -74,11 +108,7 @@ fn strings(
             ));
         };
         result
-            .map(|hits| {
-                hits.into_iter()
-                    .map(|hit| (hit.text, hit.start.offset.get()))
-                    .collect()
-            })
+            .map(|hits| hits.into_iter().map(PyStringHit::from).collect())
             .map_err(|error| StringsException::new_err(error.to_string()))
     })
 }
@@ -90,7 +120,7 @@ fn strings(
 /// :param min_length: strings minimum length
 /// :param encoding: strings encoding (default is ["ascii"])
 /// :param buffer_size: the buffer size to read the file (relevant only to file_path option)
-/// :return: list of tuples of string and offset
+/// :return: None
 /// :raises: raise StringsException if there is any error during string extraction
 ///          raise EncodingNotFoundException if the function got an unsupported encondings
 #[pyfunction()]
@@ -147,6 +177,7 @@ fn dump_strings(
 #[pymodule]
 #[pyo3(name = "rust_strings")]
 fn rust_strings(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PyStringHit>()?;
     m.add_function(wrap_pyfunction!(strings, m)?)?;
     m.add_function(wrap_pyfunction!(dump_strings, m)?)?;
     m.add(

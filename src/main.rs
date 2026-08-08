@@ -5,7 +5,7 @@ use std::process::exit;
 use std::str::FromStr;
 
 #[derive(Parser, Debug)]
-#[clap(version = "1.0", author = "Iddo Hauschner", name = "rust-strings")]
+#[command(version, author, name = "rust-strings")]
 struct Opts {
     /// file path to run strings on, use "-" for stdin
     #[clap(name = "FILE_PATH_ARG")]

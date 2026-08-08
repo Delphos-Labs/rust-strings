@@ -1,14 +1,14 @@
 [package]
 name = "rust-strings"
-version = "0.6.2"
+version = "0.7.0"
 edition = "2021"
 license = "MIT"
-authors = ["iddohau@gmail.com"]
-description = "`rust-strings` is a library to extract ascii strings from binary data"
+authors = ["Delphos Labs"]
+description = "Streaming ASCII and Unicode UTF-16 string extraction for binary data"
 readme = "README.md"
 documentation = "https://docs.rs/rust-strings"
-repository = "https://github.com/iddohau/rust-strings"
-homepage = "https://github.com/iddohau/rust-strings"
+repository = "https://github.com/Delphos-Labs/rust-strings"
+homepage = "https://github.com/Delphos-Labs/rust-strings"
 keywords = ["strings", "encoding"]
 categories = ["encoding"]
 include = ["/LICENSE.txt", "/README.md", "/src", "/pyproject.toml"]

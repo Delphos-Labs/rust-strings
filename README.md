@@ -1,7 +1,7 @@
 # rust-strings
 
-[![CI](https://github.com/iddohau/rust-strings/workflows/Rust%20Lint%20%26%20Test/badge.svg?branch=main)](https://github.com/iddohau/rust-strings/actions?query=branch=main)
-![License](https://img.shields.io/github/license/iddohau/rust-strings)
+[![CI](https://github.com/Delphos-Labs/rust-strings/workflows/Rust%20Lint%20%26%20Test/badge.svg?branch=main)](https://github.com/Delphos-Labs/rust-strings/actions?query=branch=main)
+![License](https://img.shields.io/github/license/Delphos-Labs/rust-strings)
 ![Crates.io](https://img.shields.io/crates/v/rust-strings)
 [![PyPI](https://img.shields.io/pypi/v/rust-strings.svg)](https://pypi.org/project/rust-strings)
 
@@ -24,7 +24,7 @@ pip install rust-strings
 
 ```bash
 [dependencies]
-rust-strings = "0.6.2"
+rust-strings = "0.7.0"
 ```
 
 ## Usage
@@ -34,14 +34,9 @@ rust-strings = "0.6.2"
 ```python
 import rust_strings
 
-# Get all ascii strings from file with minimun length of string
-rust_strings.strings(file_path="/bin/ls", min_length=3)
-# [('ELF', 1),
-#  ('/lib64/ld-linux-x86-64.so.2', 680),
-#  ('GNU', 720),
-#  ('.<O', 725),
-#  ('GNU', 756),
-# ...]
+# Get typed ASCII hits from a file with a minimum string length.
+hits = rust_strings.strings(file_path="/bin/ls", min_length=3)
+# hits[0].text, hits[0].source_offset, hits[0].encoding
 
 # You can also set buffer size when reading from file (default is 1mb)
 rust_strings.strings(file_path="/bin/ls", min_length=5, buffer_size=1024)
@@ -54,7 +49,7 @@ rust_strings.strings(file_path=r"C:\Windows\notepad.exe", min_length=5, encoding
 
 # You can also pass bytes instead of file_path
 rust_strings.strings(bytes=b"test\x00\x00", min_length=4, encodings=["ascii"])
-# [("test", 0)]
+# The result contains StringHit objects with text, offsets, encoding, and lengths.
 
 # You can also dump to json file
 rust_strings.dump_strings("strings.json", bytes=b"test\x00\x00", min_length=4, encodings=["ascii"])
@@ -118,6 +113,10 @@ ASCII. It does not suppress null-interleaved or high-byte UTF-16 text.
 An all-ASCII UTF-16 hit wins over its one-byte shifted suffix and non-ASCII
 shifted copy. Other overlapping Unicode hits remain because the bytes do not
 prove which interpretation is intentional.
+
+If both overlapping views decode to valid non-ASCII Unicode, the scanner keeps
+both in decoder order. Neither view has stronger byte evidence. Retaining both
+avoids falsely deleting a valid string based only on alignment.
 
 If any sink callback fails, scanning stops without another sink callback.
 
