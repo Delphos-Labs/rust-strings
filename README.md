@@ -114,6 +114,12 @@ An all-ASCII UTF-16 hit wins over its one-byte shifted suffix and non-ASCII
 shifted copy. Other overlapping Unicode hits remain because the bytes do not
 prove which interpretation is intentional.
 
+Exact adjacent ASCII copies in opposite endian modes are byte-ambiguous. The
+scanner prefers a decoder lane only when that lane starts at source offset zero
+or continues two bytes after its previous hit. The two-byte gap is one UTF-16
+NUL terminator. This removes the shifted copy at a neighboring string boundary.
+Without either fact, the scanner retains both views instead of guessing.
+
 If both overlapping views decode to valid non-ASCII Unicode, the scanner keeps
 both in decoder order. Neither view has stronger byte evidence. Retaining both
 avoids falsely deleting a valid string based only on alignment.

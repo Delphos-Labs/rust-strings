@@ -97,6 +97,16 @@ fn utf16(text: &str, big_endian: bool, alignment: u8) -> Vec<u8> {
     bytes
 }
 
+fn append_utf16(bytes: &mut Vec<u8>, text: &str, big_endian: bool, terminate: bool) {
+    for unit in text.encode_utf16().chain(terminate.then_some(0)) {
+        bytes.extend(if big_endian {
+            unit.to_be_bytes()
+        } else {
+            unit.to_le_bytes()
+        });
+    }
+}
+
 fn matching_record<'a>(sink: &'a CollectSink, text: &str, offset: u64) -> &'a Record {
     sink.records
         .iter()
@@ -459,6 +469,108 @@ fn odd_aligned_utf16_wins_over_shifted_artifacts() {
         .count();
     assert_eq!(matches, 1);
     assert!(summary.suppressed_candidate_count > 0);
+}
+
+fn assert_unique_record(sink: &CollectSink, text: &str, offset: u64, encoding: Encoding) {
+    let matches = sink
+        .records
+        .iter()
+        .filter(|record| record.text == text)
+        .collect::<Vec<_>>();
+    assert_eq!(matches.len(), 1, "{text:?}: {matches:?}");
+    assert_eq!(matches[0].start.offset.get(), offset);
+    assert_eq!(matches[0].start.encoding, encoding);
+}
+
+fn oversized_neighbor_fixture(big_endian: bool) -> (Vec<u8>, u64) {
+    const LARGE_LENGTH: usize = 64 * 1024 + 1;
+    let mut bytes = Vec::new();
+    append_utf16(&mut bytes, "MATCH_A", big_endian, true);
+    for _ in 0..LARGE_LENGTH {
+        bytes.extend(if big_endian {
+            u16::from(b'X').to_be_bytes()
+        } else {
+            u16::from(b'X').to_le_bytes()
+        });
+    }
+    bytes.extend(if big_endian {
+        0_u16.to_be_bytes()
+    } else {
+        0_u16.to_le_bytes()
+    });
+    let match_b_offset = bytes.len() as u64;
+    append_utf16(&mut bytes, "MATCH_B", big_endian, true);
+    (bytes, match_b_offset)
+}
+
+#[test]
+fn utf16le_large_neighbor_prefers_exact_candidate_over_shifted_be_copy() {
+    let (bytes, match_b_offset) = oversized_neighbor_fixture(false);
+    let mut reader = bytes.as_slice();
+    let mut sink = CollectSink::default();
+    scan(
+        &mut reader,
+        &options(4, &[Encoding::ASCII, Encoding::UTF16LE, Encoding::UTF16BE]),
+        &mut sink,
+    )
+    .unwrap();
+
+    assert_unique_record(&sink, "MATCH_A", 0, Encoding::UTF16LE);
+    assert_unique_record(&sink, "MATCH_B", match_b_offset, Encoding::UTF16LE);
+}
+
+#[test]
+fn utf16be_large_neighbor_prefers_exact_candidate_over_shifted_le_copy() {
+    let (bytes, match_b_offset) = oversized_neighbor_fixture(true);
+    let mut reader = bytes.as_slice();
+    let mut sink = CollectSink::default();
+    scan(
+        &mut reader,
+        &options(4, &[Encoding::ASCII, Encoding::UTF16LE, Encoding::UTF16BE]),
+        &mut sink,
+    )
+    .unwrap();
+
+    assert_unique_record(&sink, "MATCH_A", 0, Encoding::UTF16BE);
+    assert_unique_record(&sink, "MATCH_B", match_b_offset, Encoding::UTF16BE);
+}
+
+#[test]
+fn genuine_odd_aligned_utf16_survives_exact_copy_suppression() {
+    for (encoding, big_endian) in [(Encoding::UTF16LE, false), (Encoding::UTF16BE, true)] {
+        let bytes = utf16("ODD_REAL", big_endian, 1);
+        let mut reader = bytes.as_slice();
+        let mut sink = CollectSink::default();
+        scan(
+            &mut reader,
+            &options(4, &[Encoding::ASCII, Encoding::UTF16LE, Encoding::UTF16BE]),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_unique_record(&sink, "ODD_REAL", 1, encoding);
+    }
+}
+
+#[test]
+fn eof_candidate_prefers_exact_encoding_without_hiding_its_neighbor() {
+    for (encoding, big_endian) in [(Encoding::UTF16LE, false), (Encoding::UTF16BE, true)] {
+        let mut bytes = Vec::new();
+        append_utf16(&mut bytes, "LEFT", big_endian, true);
+        let target_offset = bytes.len() as u64;
+        append_utf16(&mut bytes, "TARGET", big_endian, false);
+        let mut reader = bytes.as_slice();
+        let mut sink = CollectSink::default();
+        scan(
+            &mut reader,
+            &options(4, &[Encoding::ASCII, Encoding::UTF16LE, Encoding::UTF16BE]),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_unique_record(&sink, "LEFT", 0, encoding);
+        assert_unique_record(&sink, "TARGET", target_offset, encoding);
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]

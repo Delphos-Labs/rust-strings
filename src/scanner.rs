@@ -291,6 +291,7 @@ struct Scanner<'a, S> {
     next_hit_id: u64,
     summary: ScanSummary,
     last_ascii: Option<CandidateRange>,
+    last_utf16: Vec<Option<CandidateRange>>,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -372,6 +373,7 @@ impl<'a, S: StringSink> Scanner<'a, S> {
                 }
             }
         }
+        let last_utf16 = vec![None; decoders.len()];
         Self {
             sink,
             min_length: options.min_length(),
@@ -379,6 +381,7 @@ impl<'a, S: StringSink> Scanner<'a, S> {
             next_hit_id: 0,
             summary: ScanSummary::default(),
             last_ascii: None,
+            last_utf16,
         }
     }
 
@@ -564,6 +567,8 @@ impl<'a, S: StringSink> Scanner<'a, S> {
                 self.decoders[index].candidate.reset();
                 if self.decoders[index].encoding == Encoding::ASCII {
                     self.last_ascii = Some(range);
+                } else {
+                    self.last_utf16[index] = Some(range);
                 }
                 checked_increment(
                     &mut self.summary.candidate_count,
@@ -603,9 +608,9 @@ impl<'a, S: StringSink> Scanner<'a, S> {
                 })
     }
 
-    fn suppresses(&self, winner: usize, candidate: usize) -> bool {
-        let winner = &self.decoders[winner];
-        let candidate = &self.decoders[candidate];
+    fn suppresses(&self, winner_index: usize, candidate_index: usize) -> bool {
+        let winner = &self.decoders[winner_index];
+        let candidate = &self.decoders[candidate_index];
         if winner.candidate.open.is_none() || candidate.candidate.open.is_none() {
             return false;
         }
@@ -615,8 +620,39 @@ impl<'a, S: StringSink> Scanner<'a, S> {
             candidate.encoding != Encoding::ASCII && ascii_suppresses(winner_range, candidate_range)
         } else {
             candidate.encoding != Encoding::ASCII
-                && utf16_suppresses_shifted(winner_range, candidate_range)
+                && (utf16_suppresses_shifted(winner_range, candidate_range)
+                    || self.prefers_exact_ascii_copy(
+                        winner_index,
+                        winner_range,
+                        candidate_index,
+                        candidate_range,
+                    ))
         }
+    }
+
+    fn prefers_exact_ascii_copy(
+        &self,
+        winner_index: usize,
+        winner_range: CandidateRange,
+        candidate_index: usize,
+        candidate_range: CandidateRange,
+    ) -> bool {
+        if !is_exact_opposite_endian_ascii_copy(
+            self.decoders[winner_index].encoding,
+            winner_range,
+            self.decoders[candidate_index].encoding,
+            candidate_range,
+        ) {
+            return false;
+        }
+
+        // Exact copies are byte-ambiguous. Prefer only a lane established by
+        // the source boundary or an adjacent terminated hit.
+        let winner_evidence = winner_range.start == 0
+            || follows_utf16_neighbor(self.last_utf16[winner_index], winner_range);
+        let candidate_evidence = candidate_range.start == 0
+            || follows_utf16_neighbor(self.last_utf16[candidate_index], candidate_range);
+        winner_evidence && !candidate_evidence
     }
 
     fn finish_eof(&mut self) -> Result<(), ScanError<S::Error>> {
@@ -686,6 +722,34 @@ fn utf16_suppresses_shifted(winner: CandidateRange, candidate: CandidateRange) -
         && winner.end.abs_diff(candidate.end) <= 1
         && winner.character_count.abs_diff(candidate.character_count) <= 1;
     shifted_suffix || non_ascii_copy
+}
+
+fn is_exact_opposite_endian_ascii_copy(
+    winner_encoding: Encoding,
+    winner: CandidateRange,
+    candidate_encoding: Encoding,
+    candidate: CandidateRange,
+) -> bool {
+    let adjacent_opposite_endian = match (winner_encoding, candidate_encoding) {
+        (Encoding::UTF16LE, Encoding::UTF16BE) => {
+            candidate.start.checked_add(1) == Some(winner.start)
+                && candidate.end.checked_add(1) == Some(winner.end)
+        }
+        (Encoding::UTF16BE, Encoding::UTF16LE) => {
+            winner.start.checked_add(1) == Some(candidate.start)
+                && winner.end.checked_add(1) == Some(candidate.end)
+        }
+        _ => false,
+    };
+    adjacent_opposite_endian
+        && winner.ascii_character_count == winner.character_count
+        && candidate.ascii_character_count == candidate.character_count
+        && winner.character_count == candidate.character_count
+}
+
+fn follows_utf16_neighbor(previous: Option<CandidateRange>, candidate: CandidateRange) -> bool {
+    // One UTF-16 NUL code unit separates neighboring candidates.
+    previous.and_then(|range| range.end.checked_add(2)) == Some(candidate.start)
 }
 
 impl Decoder {
