@@ -5,8 +5,8 @@
 //!
 //! ## Examples:
 //! ```
-//! use rust_strings::{FileConfig, BytesConfig, strings, dump_strings, Encoding};
-//! use std::path::{Path, PathBuf};
+//! use rust_strings::{FileConfig, BytesConfig, strings, Encoding};
+//! use std::path::Path;
 //!
 //! let config = FileConfig::new(Path::new("/bin/ls")).with_min_length(5);
 //! let extracted_strings = strings(&config);
@@ -26,24 +26,21 @@
 //!
 //! let config = BytesConfig::new(b"test\x00".to_vec());
 //! let extracted_strings = strings(&config);
-//! assert_eq!(vec![(String::from("test"), 0)], extracted_strings.unwrap());
-//!
-//! // Dump strings into `strings.json` file.
-//! let config = BytesConfig::new(b"test\x00".to_vec());
-//! dump_strings(&config, PathBuf::from("strings.json"));
+//! let hit = extracted_strings.unwrap().remove(0);
+//! assert_eq!(hit.text, "test");
+//! assert_eq!(hit.start.offset.get(), 0);
 //! ```
 
-use std::error::Error;
-
 mod encodings;
+mod scanner;
 mod strings;
-mod strings_extractor;
-mod strings_writer;
-
-type ErrorResult = Result<(), Box<dyn Error>>;
 
 pub use encodings::{Encoding, EncodingNotFoundError};
-pub use strings::{dump_strings, strings, BytesConfig, Config, FileConfig, StdinConfig};
+pub use scanner::{
+    scan, HitFinish, HitId, HitStart, OverflowError, ScanError, ScanOptions, ScanOptionsError,
+    ScanSummary, SinkControl, SourceLength, SourceOffset, StringSink,
+};
+pub use strings::{dump_strings, strings, BytesConfig, Config, FileConfig, StdinConfig, StringHit};
 
 #[cfg(feature = "python_bindings")]
 mod python_bindings;

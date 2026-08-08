@@ -1,18 +1,51 @@
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
-use std::error::Error;
 use std::path::PathBuf;
 use std::str::FromStr;
 
 use crate::encodings::EncodingNotFoundError;
 use crate::{
     dump_strings as r_dump_strings, strings as r_strings, BytesConfig as RustBytesConfig,
-    Encoding as RustEncoding, ErrorResult, FileConfig as RustFileConfig,
+    Encoding as RustEncoding, FileConfig as RustFileConfig, StringHit as RustStringHit,
 };
 
 create_exception!(pystrings, StringsException, PyException);
 create_exception!(pystrings, EncodingNotFoundException, StringsException);
+
+#[pyclass(name = "StringHit", frozen, module = "rust_strings")]
+struct PyStringHit {
+    #[pyo3(get)]
+    text: String,
+    #[pyo3(get)]
+    source_offset: u64,
+    #[pyo3(get)]
+    source_byte_length: u64,
+    #[pyo3(get)]
+    encoding: String,
+    #[pyo3(get)]
+    character_count: u64,
+    #[pyo3(get)]
+    decoded_utf8_length: u64,
+}
+
+impl From<RustStringHit> for PyStringHit {
+    fn from(hit: RustStringHit) -> Self {
+        let encoding = match hit.start.encoding {
+            RustEncoding::ASCII => "ascii",
+            RustEncoding::UTF16LE => "utf-16le",
+            RustEncoding::UTF16BE => "utf-16be",
+        };
+        Self {
+            text: hit.text,
+            source_offset: hit.start.offset.get(),
+            source_byte_length: hit.finish.source_length.get(),
+            encoding: encoding.to_owned(),
+            character_count: hit.finish.character_count,
+            decoded_utf8_length: hit.finish.decoded_utf8_length,
+        }
+    }
+}
 
 impl From<EncodingNotFoundError> for PyErr {
     fn from(err: EncodingNotFoundError) -> PyErr {
@@ -26,7 +59,7 @@ impl From<EncodingNotFoundError> for PyErr {
 /// :param min_length: strings minimum length
 /// :param encoding: strings encoding (default is ["ascii"])
 /// :param buffer_size: the buffer size to read the file (relevant only to file_path option)
-/// :return: list of tuples of string and offset
+/// :return: list of typed string hits with source and decoded metadata
 /// :raises: raise StringsException if there is any error during string extraction
 ///          raise EncodingNotFoundException if the function got an unsupported encondings
 #[pyfunction()]
@@ -38,7 +71,7 @@ impl From<EncodingNotFoundError> for PyErr {
     buffer_size = 1024 * 1024
 ))]
 #[pyo3(
-    text_signature = "(file_path: Optional[Union[str, Path]] = None, bytes: Optional[bytes] = None, min_length: int = 3, encoding: List[str] = [\"ascii\"], buffer_size: int = 1024 * 1024) -> List[Tuple[str, int]]"
+    text_signature = "(file_path: Optional[Union[str, Path]] = None, bytes: Optional[bytes] = None, min_length: int = 3, encoding: List[str] = [\"ascii\"], buffer_size: int = 1024 * 1024) -> List[StringHit]"
 )]
 fn strings(
     py: Python<'_>,
@@ -47,9 +80,9 @@ fn strings(
     min_length: usize,
     encodings: Vec<&str>,
     buffer_size: usize,
-) -> PyResult<Vec<(String, u64)>> {
+) -> PyResult<Vec<PyStringHit>> {
     py.allow_threads(|| {
-        if matches!(file_path, Some(_)) && matches!(bytes, Some(_)) {
+        if file_path.is_some() && bytes.is_some() {
             return Err(StringsException::new_err(
                 "You can't specify file_path and bytes",
             ));
@@ -58,27 +91,25 @@ fn strings(
             .iter()
             .map(|e| RustEncoding::from_str(e))
             .collect::<Result<Vec<RustEncoding>, _>>()?;
-        let result: Result<Vec<(String, u64)>, Box<dyn Error>>;
-        if let Some(file_path) = file_path {
+        let result = if let Some(file_path) = file_path {
             let strings_config = RustFileConfig::new(&file_path)
                 .with_min_length(min_length)
                 .with_encodings(encodings)
                 .with_buffer_size(buffer_size);
-            result = r_strings(&strings_config);
+            r_strings(&strings_config)
         } else if let Some(bytes) = bytes {
             let strings_config = RustBytesConfig::new(bytes)
                 .with_min_length(min_length)
                 .with_encodings(encodings);
-            result = r_strings(&strings_config);
+            r_strings(&strings_config)
         } else {
             return Err(StringsException::new_err(
                 "You must specify file_path or bytes",
             ));
-        }
-        if let Err(error_message) = result {
-            return Err(StringsException::new_err(format!("{}", error_message)));
-        }
-        Ok(result.unwrap())
+        };
+        result
+            .map(|hits| hits.into_iter().map(PyStringHit::from).collect())
+            .map_err(|error| StringsException::new_err(error.to_string()))
     })
 }
 
@@ -89,7 +120,7 @@ fn strings(
 /// :param min_length: strings minimum length
 /// :param encoding: strings encoding (default is ["ascii"])
 /// :param buffer_size: the buffer size to read the file (relevant only to file_path option)
-/// :return: list of tuples of string and offset
+/// :return: None
 /// :raises: raise StringsException if there is any error during string extraction
 ///          raise EncodingNotFoundException if the function got an unsupported encondings
 #[pyfunction()]
@@ -114,7 +145,7 @@ fn dump_strings(
     buffer_size: usize,
 ) -> PyResult<()> {
     py.allow_threads(|| {
-        if matches!(file_path, Some(_)) && matches!(bytes, Some(_)) {
+        if file_path.is_some() && bytes.is_some() {
             return Err(StringsException::new_err(
                 "You can't specify file_path and bytes",
             ));
@@ -123,33 +154,30 @@ fn dump_strings(
             .iter()
             .map(|e| RustEncoding::from_str(e))
             .collect::<Result<Vec<RustEncoding>, _>>()?;
-        let result: ErrorResult;
-        if let Some(file_path) = file_path {
+        let result = if let Some(file_path) = file_path {
             let strings_config = RustFileConfig::new(&file_path)
                 .with_min_length(min_length)
                 .with_encodings(encodings)
                 .with_buffer_size(buffer_size);
-            result = r_dump_strings(&strings_config, output_file);
+            r_dump_strings(&strings_config, output_file)
         } else if let Some(bytes) = bytes {
             let strings_config = RustBytesConfig::new(bytes)
                 .with_min_length(min_length)
                 .with_encodings(encodings);
-            result = r_dump_strings(&strings_config, output_file);
+            r_dump_strings(&strings_config, output_file)
         } else {
             return Err(StringsException::new_err(
                 "You must specify file_path or bytes",
             ));
-        }
-        if let Err(error_message) = result {
-            return Err(StringsException::new_err(format!("{}", error_message)));
-        }
-        Ok(())
+        };
+        result.map_err(|error| StringsException::new_err(error.to_string()))
     })
 }
 
 #[pymodule]
 #[pyo3(name = "rust_strings")]
 fn rust_strings(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PyStringHit>()?;
     m.add_function(wrap_pyfunction!(strings, m)?)?;
     m.add_function(wrap_pyfunction!(dump_strings, m)?)?;
     m.add(

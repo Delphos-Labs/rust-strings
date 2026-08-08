@@ -1,7 +1,7 @@
 # rust-strings
 
-[![CI](https://github.com/iddohau/rust-strings/workflows/Rust%20Lint%20%26%20Test/badge.svg?branch=main)](https://github.com/iddohau/rust-strings/actions?query=branch=main)
-![License](https://img.shields.io/github/license/iddohau/rust-strings)
+[![CI](https://github.com/Delphos-Labs/rust-strings/workflows/Rust%20Lint%20%26%20Test/badge.svg?branch=main)](https://github.com/Delphos-Labs/rust-strings/actions?query=branch=main)
+![License](https://img.shields.io/github/license/Delphos-Labs/rust-strings)
 ![Crates.io](https://img.shields.io/crates/v/rust-strings)
 [![PyPI](https://img.shields.io/pypi/v/rust-strings.svg)](https://pypi.org/project/rust-strings)
 
@@ -24,7 +24,7 @@ pip install rust-strings
 
 ```bash
 [dependencies]
-rust-strings = "0.6.2"
+rust-strings = "0.7.0"
 ```
 
 ## Usage
@@ -34,14 +34,9 @@ rust-strings = "0.6.2"
 ```python
 import rust_strings
 
-# Get all ascii strings from file with minimun length of string
-rust_strings.strings(file_path="/bin/ls", min_length=3)
-# [('ELF', 1),
-#  ('/lib64/ld-linux-x86-64.so.2', 680),
-#  ('GNU', 720),
-#  ('.<O', 725),
-#  ('GNU', 756),
-# ...]
+# Get typed ASCII hits from a file with a minimum string length.
+hits = rust_strings.strings(file_path="/bin/ls", min_length=3)
+# hits[0].text, hits[0].source_offset, hits[0].encoding
 
 # You can also set buffer size when reading from file (default is 1mb)
 rust_strings.strings(file_path="/bin/ls", min_length=5, buffer_size=1024)
@@ -54,7 +49,7 @@ rust_strings.strings(file_path=r"C:\Windows\notepad.exe", min_length=5, encoding
 
 # You can also pass bytes instead of file_path
 rust_strings.strings(bytes=b"test\x00\x00", min_length=4, encodings=["ascii"])
-# [("test", 0)]
+# The result contains StringHit objects with text, offsets, encoding, and lengths.
 
 # You can also dump to json file
 rust_strings.dump_strings("strings.json", bytes=b"test\x00\x00", min_length=4, encodings=["ascii"])
@@ -88,12 +83,48 @@ let extracted_strings = strings(&config);
 
 let config = BytesConfig::new(b"test\x00".to_vec());
 let extracted_strings = strings(&config);
-assert_eq!(vec![(String::from("test"), 0)], extracted_strings.unwrap());
+let hit = extracted_strings.unwrap().remove(0);
+assert_eq!(hit.text, "test");
+assert_eq!(hit.start.offset.get(), 0);
 
 // Dump strings into `strings.json` file.
 let config = BytesConfig::new(b"test\x00".to_vec());
 dump_strings(&config, PathBuf::from("strings.json"));
 ```
+
+Use `scan` when the caller must own input and output streaming. Sink callbacks
+can overlap, so each callback includes a stable `HitId`. A sink can return
+`SkipCurrent` to stop text delivery while the scanner continues to count the
+candidate and scan the input.
+
+### Ordering and suppression
+
+The scanner processes encodings in option order. UTF-16 alignment zero runs
+before alignment one. It assigns hit IDs when candidates reach the minimum.
+
+Chunks follow their start immediately. At a shared boundary, the scanner
+aborts known artifacts before it finishes the preferred hit. At EOF, it closes
+decoders in the same order.
+
+ASCII wins when a UTF-16 view has the same byte range, within one alignment
+byte, and contains non-ASCII scalars. This removes UTF-16 garbage from normal
+ASCII. It does not suppress null-interleaved or high-byte UTF-16 text.
+
+An all-ASCII UTF-16 hit wins over its one-byte shifted suffix and non-ASCII
+shifted copy. Other overlapping Unicode hits remain because the bytes do not
+prove which interpretation is intentional.
+
+Exact adjacent ASCII copies in opposite endian modes are byte-ambiguous. The
+scanner prefers a decoder lane only when that lane starts at source offset zero
+or continues two bytes after its previous hit. The two-byte gap is one UTF-16
+NUL terminator. This removes the shifted copy at a neighboring string boundary.
+Without either fact, the scanner retains both views instead of guessing.
+
+If both overlapping views decode to valid non-ASCII Unicode, the scanner keeps
+both in decoder order. Neither view has stronger byte evidence. Retaining both
+avoids falsely deleting a valid string based only on alignment.
+
+If any sink callback fails, scanning stops without another sink callback.
 
 ## Contributing
 Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.

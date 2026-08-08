@@ -15,48 +15,62 @@ def temp_file(tmp_path: Path) -> Path:
     os.remove(file)
 
 
+def pairs(hits):
+    return [(hit.text, hit.source_offset) for hit in hits]
+
+
 def test_bytes():
     extracted = rust_strings.strings(bytes=b"test\x00")
-    assert extracted == [("test", 0)]
+    assert isinstance(extracted[0], rust_strings.StringHit)
+    assert pairs(extracted) == [("test", 0)]
+    assert extracted[0].source_byte_length == 4
+    assert extracted[0].encoding == "ascii"
+    assert extracted[0].character_count == 4
+    assert extracted[0].decoded_utf8_length == 4
 
 
 def test_bytes_min_length_1():
     extracted = rust_strings.strings(bytes=b"test\x00", min_length=1)
-    assert extracted == [("test", 0)]
+    assert pairs(extracted) == [("test", 0)]
 
 
 def test_single_byte():
     extracted = rust_strings.strings(bytes=b"t\x00", min_length=1)
-    assert extracted == [("t", 0)]
+    assert pairs(extracted) == [("t", 0)]
 
 
 def test_bytes_with_offset():
     extracted = rust_strings.strings(bytes=b"\x00test")
-    assert extracted == [("test", 1)]
+    assert pairs(extracted) == [("test", 1)]
 
 
 def test_bytes_multiple():
     extracted = rust_strings.strings(bytes=b"\x00test\x00test")
-    assert extracted == [("test", 1), ("test", 6)]
+    assert pairs(extracted) == [("test", 1), ("test", 6)]
 
 
 def test_file(temp_file: Path):
     temp_file.write_bytes(b"test\x00")
     extracted = rust_strings.strings(file_path=temp_file)
-    assert extracted == [("test", 0)]
+    assert pairs(extracted) == [("test", 0)]
 
 
 def test_file_as_str(temp_file: Path):
     temp_file.write_bytes(b"test\x00")
     extracted = rust_strings.strings(file_path=str(temp_file))
-    assert extracted == [("test", 0)]
+    assert pairs(extracted) == [("test", 0)]
 
 
 def test_multiple_encodings():
     extracted = rust_strings.strings(
-        bytes=b"ascii\x01t\x00e\x00s\x00t\x00\x00\x00", encodings=["ascii", "utf-16le"]
+        bytes=b"ascii\x00\x00\xdct\x00e\x00s\x00t\x00\x00\x00",
+        encodings=["ascii", "utf-16le"],
     )
-    assert extracted == [("ascii", 0), ("test", 6)]
+    assert ("ascii", 0) in pairs(extracted)
+    assert ("test", 8) in pairs(extracted)
+    utf16 = next(hit for hit in extracted if hit.text == "test")
+    assert utf16.encoding == "utf-16le"
+    assert utf16.source_byte_length == 8
 
 
 def test_json_dump(temp_file: Path):
