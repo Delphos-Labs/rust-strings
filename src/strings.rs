@@ -1,21 +1,22 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::error::Error;
 use std::fs::File;
 use std::io::{self, BufReader, Cursor, Write};
 use std::path::{Path, PathBuf};
 
-use crate::{scan, Encoding, HitFinish, HitId, HitStart, ScanOptions, SinkControl, StringSink};
+use crate::{
+    scan, Encoding, HitFinish, HitId, HitStart, ScanError, ScanOptions, ScanSummary, SinkControl,
+    StringSink,
+};
 
 const DEFAULT_MIN_LENGTH: usize = 3;
 const DEFAULT_ENCODINGS: [Encoding; 2] = [Encoding::ASCII, Encoding::UTF16LE];
 
 pub trait Config {
     #[doc(hidden)]
-    fn scan_with<S>(&self, sink: &mut S) -> Result<(), Box<dyn Error>>
+    fn scan_with<S>(&self, sink: &mut S) -> Result<ScanSummary, ScanError<S::Error>>
     where
-        S: StringSink,
-        S::Error: Error + 'static;
+        S: StringSink;
 
     #[doc(hidden)]
     fn get_min_length(&self) -> usize;
@@ -87,16 +88,15 @@ impl<'a> FileConfig<'a> {
 }
 
 impl Config for FileConfig<'_> {
-    fn scan_with<S>(&self, sink: &mut S) -> Result<(), Box<dyn Error>>
+    fn scan_with<S>(&self, sink: &mut S) -> Result<ScanSummary, ScanError<S::Error>>
     where
         S: StringSink,
-        S::Error: Error + 'static,
     {
-        let options = ScanOptions::new(self.get_min_length(), self.get_encodings())?;
-        let file = File::open(self.file_path)?;
+        let options = ScanOptions::new(self.get_min_length(), self.get_encodings())
+            .map_err(ScanError::Config)?;
+        let file = File::open(self.file_path).map_err(ScanError::Reader)?;
         let mut reader = BufReader::with_capacity(self.buffer_size, file);
-        scan(&mut reader, &options, sink)?;
-        Ok(())
+        scan(&mut reader, &options, sink)
     }
 
     impl_config_accessors!();
@@ -134,16 +134,15 @@ impl StdinConfig {
 }
 
 impl Config for StdinConfig {
-    fn scan_with<S>(&self, sink: &mut S) -> Result<(), Box<dyn Error>>
+    fn scan_with<S>(&self, sink: &mut S) -> Result<ScanSummary, ScanError<S::Error>>
     where
         S: StringSink,
-        S::Error: Error + 'static,
     {
-        let options = ScanOptions::new(self.get_min_length(), self.get_encodings())?;
+        let options = ScanOptions::new(self.get_min_length(), self.get_encodings())
+            .map_err(ScanError::Config)?;
         let stdin = io::stdin();
         let mut reader = BufReader::with_capacity(self.buffer_size, stdin.lock());
-        scan(&mut reader, &options, sink)?;
-        Ok(())
+        scan(&mut reader, &options, sink)
     }
 
     impl_config_accessors!();
@@ -168,31 +167,41 @@ impl BytesConfig {
 }
 
 impl Config for BytesConfig {
-    fn scan_with<S>(&self, sink: &mut S) -> Result<(), Box<dyn Error>>
+    fn scan_with<S>(&self, sink: &mut S) -> Result<ScanSummary, ScanError<S::Error>>
     where
         S: StringSink,
-        S::Error: Error + 'static,
     {
-        let options = ScanOptions::new(self.get_min_length(), self.get_encodings())?;
+        let options = ScanOptions::new(self.get_min_length(), self.get_encodings())
+            .map_err(ScanError::Config)?;
         let mut reader = Cursor::new(self.bytes.as_slice());
-        scan(&mut reader, &options, sink)?;
-        Ok(())
+        scan(&mut reader, &options, sink)
     }
 
     impl_config_accessors!();
 }
 
-#[derive(Default)]
-struct VectorSink {
-    active: HashMap<HitId, (String, u64)>,
-    complete: Vec<(HitId, String, u64)>,
+/// One complete collected scanner hit.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StringHit {
+    /// The complete decoded text.
+    pub text: String,
+    /// The source offset and encoding.
+    pub start: HitStart,
+    /// The source and decoded lengths.
+    pub finish: HitFinish,
 }
 
-impl StringSink for VectorSink {
+#[derive(Default)]
+struct CollectSink {
+    active: HashMap<HitId, (HitStart, String)>,
+    complete: Vec<(HitId, StringHit)>,
+}
+
+impl StringSink for CollectSink {
     type Error = Infallible;
 
     fn start(&mut self, id: HitId, hit: HitStart) -> Result<SinkControl, Self::Error> {
-        self.active.insert(id, (String::new(), hit.offset.get()));
+        self.active.insert(id, (hit, String::new()));
         Ok(SinkControl::Continue)
     }
 
@@ -200,14 +209,21 @@ impl StringSink for VectorSink {
         self.active
             .get_mut(&id)
             .expect("active hit")
-            .0
+            .1
             .push_str(text);
         Ok(SinkControl::Continue)
     }
 
-    fn finish(&mut self, id: HitId, _hit: HitFinish) -> Result<(), Self::Error> {
-        let (text, offset) = self.active.remove(&id).expect("active hit");
-        self.complete.push((id, text, offset));
+    fn finish(&mut self, id: HitId, finish: HitFinish) -> Result<(), Self::Error> {
+        let (start, text) = self.active.remove(&id).expect("active hit");
+        self.complete.push((
+            id,
+            StringHit {
+                text,
+                start,
+                finish,
+            },
+        ));
         Ok(())
     }
 
@@ -217,32 +233,75 @@ impl StringSink for VectorSink {
     }
 }
 
-pub fn strings<T: Config>(config: &T) -> Result<Vec<(String, u64)>, Box<dyn Error>> {
-    let mut sink = VectorSink::default();
+pub fn strings<T: Config>(config: &T) -> Result<Vec<StringHit>, ScanError<Infallible>> {
+    let mut sink = CollectSink::default();
     config.scan_with(&mut sink)?;
     sink.complete
-        .sort_by_key(|(id, _, offset)| (*offset, id.get()));
-    Ok(sink
-        .complete
-        .into_iter()
-        .map(|(_, text, offset)| (text, offset))
-        .collect())
+        .sort_by_key(|(id, hit)| (hit.start.offset, *id));
+    Ok(sink.complete.into_iter().map(|(_, hit)| hit).collect())
 }
 
-pub fn dump_strings<T: Config>(config: &T, output: PathBuf) -> Result<(), Box<dyn Error>> {
-    let strings = strings(config)?;
-    let mut writer = File::create(output)?;
-    writer.write_all(b"[")?;
-    for (index, (text, offset)) in strings.iter().enumerate() {
-        if index != 0 {
-            writer.write_all(b",")?;
-        }
-        writer.write_all(b"[\"")?;
-        write_json_string_contents(&mut writer, text)?;
-        write!(writer, "\",{offset}]")?;
+struct JsonSink<W> {
+    writer: W,
+    active: HashMap<HitId, (HitStart, String)>,
+    first: bool,
+}
+
+impl<W: Write> JsonSink<W> {
+    fn new(mut writer: W) -> io::Result<Self> {
+        writer.write_all(b"[")?;
+        Ok(Self {
+            writer,
+            active: HashMap::new(),
+            first: true,
+        })
     }
-    writer.write_all(b"]")?;
-    Ok(())
+
+    fn finish_output(mut self) -> io::Result<()> {
+        self.writer.write_all(b"]")
+    }
+}
+
+impl<W: Write> StringSink for JsonSink<W> {
+    type Error = io::Error;
+
+    fn start(&mut self, id: HitId, hit: HitStart) -> Result<SinkControl, Self::Error> {
+        self.active.insert(id, (hit, String::new()));
+        Ok(SinkControl::Continue)
+    }
+
+    fn chunk(&mut self, id: HitId, text: &str) -> Result<SinkControl, Self::Error> {
+        self.active
+            .get_mut(&id)
+            .expect("active hit")
+            .1
+            .push_str(text);
+        Ok(SinkControl::Continue)
+    }
+
+    fn finish(&mut self, id: HitId, _hit: HitFinish) -> Result<(), Self::Error> {
+        let (start, text) = self.active.remove(&id).expect("active hit");
+        if !self.first {
+            self.writer.write_all(b",")?;
+        }
+        self.first = false;
+        self.writer.write_all(b"[\"")?;
+        write_json_string_contents(&mut self.writer, &text)?;
+        write!(self.writer, "\",{}]", start.offset.get())?;
+        Ok(())
+    }
+
+    fn abort(&mut self, id: HitId) -> Result<(), Self::Error> {
+        self.active.remove(&id);
+        Ok(())
+    }
+}
+
+pub fn dump_strings<T: Config>(config: &T, output: PathBuf) -> Result<(), ScanError<io::Error>> {
+    let file = File::create(output).map_err(ScanError::Sink)?;
+    let mut sink = JsonSink::new(file).map_err(ScanError::Sink)?;
+    config.scan_with(&mut sink)?;
+    sink.finish_output().map_err(ScanError::Sink)
 }
 
 fn write_json_string_contents(writer: &mut impl Write, text: &str) -> io::Result<()> {

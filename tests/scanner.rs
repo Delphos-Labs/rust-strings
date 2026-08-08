@@ -153,6 +153,7 @@ fn utf16_supports_unicode_surrogates_endianness_and_both_alignments() {
             assert_eq!(record.start.encoding, encoding);
             assert_eq!(record.finish.character_count, 4);
             assert_eq!(record.finish.source_length.get(), 10);
+            assert_eq!(record.finish.decoded_utf8_length, text.len() as u64);
         }
     }
 }
@@ -230,13 +231,17 @@ fn stable_ids_disambiguate_overlapping_active_candidates() {
 #[derive(Default)]
 struct SkipSink {
     chunks: usize,
-    finishes: usize,
+    target: Option<HitId>,
+    finish: Option<HitFinish>,
 }
 
 impl StringSink for SkipSink {
     type Error = TestError;
 
-    fn start(&mut self, _id: HitId, _start: HitStart) -> Result<SinkControl, Self::Error> {
+    fn start(&mut self, id: HitId, start: HitStart) -> Result<SinkControl, Self::Error> {
+        if start.offset.get() == 0 {
+            self.target = Some(id);
+        }
         Ok(SinkControl::SkipCurrent)
     }
 
@@ -245,8 +250,10 @@ impl StringSink for SkipSink {
         Ok(SinkControl::Continue)
     }
 
-    fn finish(&mut self, _id: HitId, _finish: HitFinish) -> Result<(), Self::Error> {
-        self.finishes += 1;
+    fn finish(&mut self, id: HitId, finish: HitFinish) -> Result<(), Self::Error> {
+        if self.target == Some(id) {
+            self.finish = Some(finish);
+        }
         Ok(())
     }
 
@@ -257,14 +264,14 @@ impl StringSink for SkipSink {
 
 #[test]
 fn skip_current_stops_text_but_preserves_finish_metadata() {
-    let mut reader = &b"a very long candidate"[..];
+    let bytes = utf16("é😀", false, 0);
+    let mut reader = bytes.as_slice();
     let mut sink = SkipSink::default();
-    let summary = scan(&mut reader, &options(3, &[Encoding::ASCII]), &mut sink).unwrap();
+    let summary = scan(&mut reader, &options(2, &[Encoding::UTF16LE]), &mut sink).unwrap();
 
     assert_eq!(sink.chunks, 0);
-    assert_eq!(sink.finishes, 1);
-    assert_eq!(summary.candidate_count, 1);
-    assert_eq!(summary.skipped_candidate_count, 1);
+    assert_eq!(sink.finish.unwrap().decoded_utf8_length, 6);
+    assert_eq!(summary.skipped_candidate_count, summary.candidate_count);
 }
 
 struct FailingReader {
@@ -293,46 +300,102 @@ fn reader_errors_are_typed_and_abort_provisional_hits() {
     assert!(sink.active.is_empty());
 }
 
-#[derive(Default)]
-struct FailingSink {
-    active: Option<HitId>,
-    aborted: bool,
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum Method {
+    Start,
+    Chunk,
+    Finish,
+    Abort,
 }
 
-impl StringSink for FailingSink {
+struct FailOnSink {
+    fail_on: Method,
+    calls: Vec<Method>,
+}
+
+impl StringSink for FailOnSink {
     type Error = TestError;
 
-    fn start(&mut self, id: HitId, _start: HitStart) -> Result<SinkControl, Self::Error> {
-        self.active = Some(id);
+    fn start(&mut self, _id: HitId, _start: HitStart) -> Result<SinkControl, Self::Error> {
+        self.call(Method::Start)?;
         Ok(SinkControl::Continue)
     }
 
     fn chunk(&mut self, _id: HitId, _text: &str) -> Result<SinkControl, Self::Error> {
-        Err(TestError("injected sink failure"))
+        self.call(Method::Chunk)?;
+        Ok(SinkControl::Continue)
     }
 
     fn finish(&mut self, _id: HitId, _finish: HitFinish) -> Result<(), Self::Error> {
-        unreachable!()
+        self.call(Method::Finish)
     }
 
-    fn abort(&mut self, id: HitId) -> Result<(), Self::Error> {
-        assert_eq!(self.active.take(), Some(id));
-        self.aborted = true;
-        Ok(())
+    fn abort(&mut self, _id: HitId) -> Result<(), Self::Error> {
+        self.call(Method::Abort)
+    }
+}
+
+impl FailOnSink {
+    fn call(&mut self, method: Method) -> Result<(), TestError> {
+        self.calls.push(method);
+        if method == self.fail_on {
+            Err(TestError("injected sink failure"))
+        } else {
+            Ok(())
+        }
     }
 }
 
 #[test]
-fn sink_errors_are_typed_and_abort_provisional_hits() {
-    let mut reader = &b"candidate"[..];
-    let mut sink = FailingSink::default();
-    let error = scan(&mut reader, &options(2, &[Encoding::ASCII]), &mut sink).unwrap_err();
+fn no_sink_callback_follows_start_chunk_or_finish_error() {
+    for (fail_on, expected) in [
+        (Method::Start, vec![Method::Start]),
+        (Method::Chunk, vec![Method::Start, Method::Chunk]),
+        (
+            Method::Finish,
+            vec![Method::Start, Method::Chunk, Method::Chunk, Method::Finish],
+        ),
+    ] {
+        let mut reader = &b"abc\0"[..];
+        let mut sink = FailOnSink {
+            fail_on,
+            calls: Vec::new(),
+        };
+        let error = scan(&mut reader, &options(2, &[Encoding::ASCII]), &mut sink).unwrap_err();
+        assert!(matches!(
+            error,
+            ScanError::Sink(TestError("injected sink failure"))
+        ));
+        assert_eq!(sink.calls, expected);
+    }
+}
+
+#[test]
+fn no_sink_callback_follows_abort_error() {
+    let mut reader = FailingReader { sent_data: false };
+    let mut sink = FailOnSink {
+        fail_on: Method::Abort,
+        calls: Vec::new(),
+    };
+    let error = scan(
+        &mut reader,
+        &options(2, &[Encoding::ASCII, Encoding::UTF16LE]),
+        &mut sink,
+    )
+    .unwrap_err();
 
     assert!(matches!(
         error,
         ScanError::Sink(TestError("injected sink failure"))
     ));
-    assert!(sink.aborted);
+    assert_eq!(sink.calls.last(), Some(&Method::Abort));
+    assert_eq!(
+        sink.calls
+            .iter()
+            .filter(|call| **call == Method::Abort)
+            .count(),
+        1
+    );
 }
 
 #[derive(Default)]
@@ -396,4 +459,69 @@ fn odd_aligned_utf16_wins_over_shifted_artifacts() {
         .count();
     assert_eq!(matches, 1);
     assert!(summary.suppressed_candidate_count > 0);
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum Event {
+    Start(u64, Encoding, u64),
+    Chunk(u64, String),
+    Finish(u64),
+    Abort(u64),
+}
+
+#[derive(Default)]
+struct EventSink(Vec<Event>);
+
+impl StringSink for EventSink {
+    type Error = TestError;
+
+    fn start(&mut self, id: HitId, start: HitStart) -> Result<SinkControl, Self::Error> {
+        self.0
+            .push(Event::Start(id.get(), start.encoding, start.offset.get()));
+        Ok(SinkControl::Continue)
+    }
+
+    fn chunk(&mut self, id: HitId, text: &str) -> Result<SinkControl, Self::Error> {
+        self.0.push(Event::Chunk(id.get(), text.to_owned()));
+        Ok(SinkControl::Continue)
+    }
+
+    fn finish(&mut self, id: HitId, _finish: HitFinish) -> Result<(), Self::Error> {
+        self.0.push(Event::Finish(id.get()));
+        Ok(())
+    }
+
+    fn abort(&mut self, id: HitId) -> Result<(), Self::Error> {
+        self.0.push(Event::Abort(id.get()));
+        Ok(())
+    }
+}
+
+#[test]
+fn overlap_events_follow_decoder_and_terminal_precedence_order() {
+    let mut reader = &b"ABCD\0"[..];
+    let mut sink = EventSink::default();
+    scan(
+        &mut reader,
+        &options(2, &[Encoding::ASCII, Encoding::UTF16LE]),
+        &mut sink,
+    )
+    .unwrap();
+
+    assert_eq!(
+        sink.0,
+        vec![
+            Event::Start(0, Encoding::ASCII, 0),
+            Event::Chunk(0, "AB".into()),
+            Event::Chunk(0, "C".into()),
+            Event::Chunk(0, "D".into()),
+            Event::Start(1, Encoding::UTF16LE, 0),
+            Event::Chunk(1, "䉁䑃".into()),
+            Event::Abort(1),
+            Event::Finish(0),
+            Event::Start(2, Encoding::UTF16LE, 1),
+            Event::Chunk(2, "䍂D".into()),
+            Event::Abort(2),
+        ]
+    );
 }

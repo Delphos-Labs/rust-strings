@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Read};
-use std::num::NonZeroUsize;
+use std::num::NonZeroU64;
 
 use crate::Encoding;
 
@@ -56,6 +56,8 @@ pub struct HitFinish {
     pub source_length: SourceLength,
     /// The number of decoded Unicode scalar values.
     pub character_count: u64,
+    /// The complete decoded text length in UTF-8 bytes.
+    pub decoded_utf8_length: u64,
 }
 
 /// Controls delivery for the hit associated with the current callback.
@@ -69,8 +71,9 @@ pub enum SinkControl {
 
 /// Receives interleaved events from all active decoder candidates.
 ///
-/// A successful `start` is followed by exactly one `finish` or `abort` with
-/// the same [`HitId`]. A hit is provisional until `finish` succeeds.
+/// While callbacks succeed, `start` is followed by one `finish` or `abort`
+/// with the same [`HitId`]. A hit is provisional until `finish` succeeds.
+/// After any callback returns an error, the scanner makes no more callbacks.
 pub trait StringSink {
     /// An error returned by this sink.
     type Error;
@@ -88,7 +91,7 @@ pub trait StringSink {
 /// Validated scanner settings.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ScanOptions {
-    min_length: NonZeroUsize,
+    min_length: NonZeroU64,
     encodings: Vec<Encoding>,
 }
 
@@ -99,7 +102,8 @@ impl ScanOptions {
         encodings: impl IntoIterator<Item = Encoding>,
     ) -> Result<Self, ScanOptionsError> {
         let min_length =
-            NonZeroUsize::new(min_length).ok_or(ScanOptionsError::ZeroMinimumLength)?;
+            u64::try_from(min_length).map_err(|_| ScanOptionsError::MinimumLengthTooLarge)?;
+        let min_length = NonZeroU64::new(min_length).ok_or(ScanOptionsError::ZeroMinimumLength)?;
         let mut selected = Vec::new();
         for encoding in encodings {
             if !selected.contains(&encoding) {
@@ -116,7 +120,7 @@ impl ScanOptions {
     }
 
     /// Returns the minimum number of decoded scalar values in a hit.
-    pub fn min_length(&self) -> usize {
+    pub fn min_length(&self) -> u64 {
         self.min_length.get()
     }
 
@@ -131,6 +135,8 @@ impl ScanOptions {
 pub enum ScanOptionsError {
     /// The minimum candidate length was zero.
     ZeroMinimumLength,
+    /// The minimum candidate length does not fit the `u64` domain.
+    MinimumLengthTooLarge,
     /// The encoding list was empty.
     NoEncodings,
 }
@@ -139,6 +145,7 @@ impl fmt::Display for ScanOptionsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ZeroMinimumLength => f.write_str("minimum length must be greater than zero"),
+            Self::MinimumLengthTooLarge => f.write_str("minimum length exceeds u64"),
             Self::NoEncodings => f.write_str("at least one encoding must be selected"),
         }
     }
@@ -149,17 +156,23 @@ impl Error for ScanOptionsError {}
 /// A failure from the caller-owned reader or sink.
 #[derive(Debug)]
 pub enum ScanError<E> {
+    /// A configuration could not produce valid scanner options.
+    Config(ScanOptionsError),
     /// The reader failed.
     Reader(io::Error),
     /// The sink failed.
     Sink(E),
+    /// A source or result counter exceeded `u64`.
+    Overflow(OverflowError),
 }
 
 impl<E: fmt::Display> fmt::Display for ScanError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Config(error) => write!(f, "configuration error: {error}"),
             Self::Reader(error) => write!(f, "reader error: {error}"),
             Self::Sink(error) => write!(f, "sink error: {error}"),
+            Self::Overflow(error) => write!(f, "counter overflow: {error}"),
         }
     }
 }
@@ -170,11 +183,34 @@ where
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Config(error) => Some(error),
             Self::Reader(error) => Some(error),
             Self::Sink(error) => Some(error),
+            Self::Overflow(error) => Some(error),
         }
     }
 }
+
+/// Identifies a scanner counter that exceeded `u64`.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum OverflowError {
+    BytesRead,
+    HitId,
+    SourceEnd,
+    CharacterCount,
+    DecodedUtf8Length,
+    CandidateCount,
+    SkippedCandidateCount,
+    SuppressedCandidateCount,
+}
+
+impl fmt::Display for OverflowError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl Error for OverflowError {}
 
 /// Counts produced by one complete scan.
 #[derive(Debug, Copy, Clone, Default, Eq, PartialEq)]
@@ -195,6 +231,7 @@ struct Candidate {
     end: u64,
     character_count: u64,
     ascii_character_count: u64,
+    decoded_utf8_length: u64,
     prefix: String,
     open: Option<OpenHit>,
 }
@@ -206,6 +243,7 @@ impl Candidate {
             end: 0,
             character_count: 0,
             ascii_character_count: 0,
+            decoded_utf8_length: 0,
             prefix: String::new(),
             open: None,
         }
@@ -216,6 +254,7 @@ impl Candidate {
         self.end = 0;
         self.character_count = 0;
         self.ascii_character_count = 0;
+        self.decoded_utf8_length = 0;
         self.prefix.clear();
         self.open = None;
     }
@@ -247,10 +286,19 @@ struct Decoder {
 
 struct Scanner<'a, S> {
     sink: &'a mut S,
-    min_length: usize,
+    min_length: u64,
     decoders: Vec<Decoder>,
     next_hit_id: u64,
     summary: ScanSummary,
+    last_ascii: Option<CandidateRange>,
+}
+
+#[derive(Debug, Copy, Clone)]
+struct CandidateRange {
+    start: u64,
+    end: u64,
+    character_count: u64,
+    ascii_character_count: u64,
 }
 
 /// Streams decoded string candidates from a caller-owned reader to a sink.
@@ -275,32 +323,25 @@ where
             Ok(read) => read,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => {
-                if let Err(sink_error) = scanner.abort_all() {
-                    return Err(ScanError::Sink(sink_error));
-                }
-                return Err(ScanError::Reader(error));
+                return Err(scanner.terminate(ScanError::Reader(error)));
             }
         };
 
         for byte in &buffer[..read] {
             let offset = scanner.summary.bytes_read;
             if let Err(error) = scanner.consume(offset, *byte) {
-                scanner.abort_all_ignoring_errors();
-                return Err(ScanError::Sink(error));
+                return Err(scanner.terminate(error));
             }
-            scanner.summary.bytes_read =
-                scanner.summary.bytes_read.checked_add(1).ok_or_else(|| {
-                    ScanError::Reader(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "input length exceeds u64",
-                    ))
-                })?;
+            if let Err(error) =
+                checked_increment(&mut scanner.summary.bytes_read, OverflowError::BytesRead)
+            {
+                return Err(scanner.terminate(ScanError::Overflow(error)));
+            }
         }
     }
 
     if let Err(error) = scanner.finish_eof() {
-        scanner.abort_all_ignoring_errors();
-        return Err(ScanError::Sink(error));
+        return Err(scanner.terminate(error));
     }
     Ok(scanner.summary)
 }
@@ -337,10 +378,11 @@ impl<'a, S: StringSink> Scanner<'a, S> {
             decoders,
             next_hit_id: 0,
             summary: ScanSummary::default(),
+            last_ascii: None,
         }
     }
 
-    fn consume(&mut self, offset: u64, byte: u8) -> Result<(), S::Error> {
+    fn consume(&mut self, offset: u64, byte: u8) -> Result<(), ScanError<S::Error>> {
         for index in 0..self.decoders.len() {
             match self.decoders[index].kind {
                 DecoderKind::Ascii => {
@@ -367,7 +409,7 @@ impl<'a, S: StringSink> Scanner<'a, S> {
         index: usize,
         unit_offset: u64,
         unit: u16,
-    ) -> Result<(), S::Error> {
+    ) -> Result<(), ScanError<S::Error>> {
         let pending_high = self.decoders[index].take_high_surrogate();
         if let Some((high_offset, high)) = pending_high {
             if (0xDC00..=0xDFFF).contains(&unit) {
@@ -405,23 +447,39 @@ impl<'a, S: StringSink> Scanner<'a, S> {
         offset: u64,
         width: u64,
         character: char,
-    ) -> Result<(), S::Error> {
+    ) -> Result<(), ScanError<S::Error>> {
         let encoding = self.decoders[index].encoding;
         let candidate = &mut self.decoders[index].candidate;
         if candidate.character_count == 0 {
             candidate.start = offset;
         }
-        candidate.end = offset + width;
-        candidate.character_count += 1;
+        candidate.end = offset
+            .checked_add(width)
+            .ok_or(ScanError::Overflow(OverflowError::SourceEnd))?;
+        checked_increment(
+            &mut candidate.character_count,
+            OverflowError::CharacterCount,
+        )
+        .map_err(ScanError::Overflow)?;
+        candidate.decoded_utf8_length = candidate
+            .decoded_utf8_length
+            .checked_add(character.len_utf8() as u64)
+            .ok_or(ScanError::Overflow(OverflowError::DecodedUtf8Length))?;
         if character.is_ascii() {
-            candidate.ascii_character_count += 1;
+            checked_increment(
+                &mut candidate.ascii_character_count,
+                OverflowError::CharacterCount,
+            )
+            .map_err(ScanError::Overflow)?;
         }
 
         if let Some(open) = candidate.open.as_mut() {
             if !open.skipped {
                 let mut encoded = [0_u8; 4];
                 let text = character.encode_utf8(&mut encoded);
-                if self.sink.chunk(open.id, text)? == SinkControl::SkipCurrent {
+                if self.sink.chunk(open.id, text).map_err(ScanError::Sink)?
+                    == SinkControl::SkipCurrent
+                {
                     open.skipped = true;
                 }
             }
@@ -429,37 +487,40 @@ impl<'a, S: StringSink> Scanner<'a, S> {
         }
 
         candidate.prefix.push(character);
-        if candidate.character_count != self.min_length as u64 {
+        if candidate.character_count != self.min_length {
             return Ok(());
         }
 
         let id = HitId(self.next_hit_id);
-        self.next_hit_id += 1;
+        self.next_hit_id = self
+            .next_hit_id
+            .checked_add(1)
+            .ok_or(ScanError::Overflow(OverflowError::HitId))?;
         let start = HitStart {
             offset: SourceOffset(candidate.start),
             encoding,
         };
-        let skipped = self.sink.start(id, start)? == SinkControl::SkipCurrent;
+        let skipped =
+            self.sink.start(id, start).map_err(ScanError::Sink)? == SinkControl::SkipCurrent;
         candidate.open = Some(OpenHit { id, skipped });
-        if !skipped && self.sink.chunk(id, &candidate.prefix)? == SinkControl::SkipCurrent {
+        if !skipped
+            && self
+                .sink
+                .chunk(id, &candidate.prefix)
+                .map_err(ScanError::Sink)?
+                == SinkControl::SkipCurrent
+        {
             candidate.open.as_mut().expect("open hit").skipped = true;
         }
         candidate.prefix.clear();
         Ok(())
     }
 
-    fn finish_detected_candidate(&mut self, index: usize) -> Result<(), S::Error> {
-        let suppress = self.is_shifted_artifact(index);
+    fn finish_detected_candidate(&mut self, index: usize) -> Result<(), ScanError<S::Error>> {
+        let suppress = self.should_suppress(index);
         if !suppress {
             let artifacts = (0..self.decoders.len())
-                .filter(|other_index| {
-                    *other_index != index
-                        && self.decoders[*other_index].encoding != Encoding::ASCII
-                        && is_artifact_of(
-                            &self.decoders[index].candidate,
-                            &self.decoders[*other_index].candidate,
-                        )
-                })
+                .filter(|other_index| *other_index != index && self.suppresses(index, *other_index))
                 .collect::<Vec<_>>();
             for artifact in artifacts {
                 self.finish_candidate(artifact, true)?;
@@ -468,83 +529,163 @@ impl<'a, S: StringSink> Scanner<'a, S> {
         self.finish_candidate(index, suppress)
     }
 
-    fn finish_candidate(&mut self, index: usize, suppress: bool) -> Result<(), S::Error> {
+    fn finish_candidate(
+        &mut self,
+        index: usize,
+        suppress: bool,
+    ) -> Result<(), ScanError<S::Error>> {
         let open = self.decoders[index].candidate.open;
         if let Some(open) = open {
             if suppress {
-                self.sink.abort(open.id)?;
-                self.summary.suppressed_candidate_count += 1;
+                self.sink.abort(open.id).map_err(ScanError::Sink)?;
+                self.decoders[index].candidate.reset();
+                checked_increment(
+                    &mut self.summary.suppressed_candidate_count,
+                    OverflowError::SuppressedCandidateCount,
+                )
+                .map_err(ScanError::Overflow)?;
             } else {
                 let candidate = &self.decoders[index].candidate;
-                self.sink.finish(
-                    open.id,
-                    HitFinish {
-                        source_length: SourceLength(candidate.end - candidate.start),
-                        character_count: candidate.character_count,
-                    },
-                )?;
-                self.summary.candidate_count += 1;
+                let source_length = candidate
+                    .end
+                    .checked_sub(candidate.start)
+                    .ok_or(ScanError::Overflow(OverflowError::SourceEnd))?;
+                let range = CandidateRange::from(candidate);
+                self.sink
+                    .finish(
+                        open.id,
+                        HitFinish {
+                            source_length: SourceLength(source_length),
+                            character_count: candidate.character_count,
+                            decoded_utf8_length: candidate.decoded_utf8_length,
+                        },
+                    )
+                    .map_err(ScanError::Sink)?;
+                self.decoders[index].candidate.reset();
+                if self.decoders[index].encoding == Encoding::ASCII {
+                    self.last_ascii = Some(range);
+                }
+                checked_increment(
+                    &mut self.summary.candidate_count,
+                    OverflowError::CandidateCount,
+                )
+                .map_err(ScanError::Overflow)?;
                 if open.skipped {
-                    self.summary.skipped_candidate_count += 1;
+                    checked_increment(
+                        &mut self.summary.skipped_candidate_count,
+                        OverflowError::SkippedCandidateCount,
+                    )
+                    .map_err(ScanError::Overflow)?;
                 }
             }
+        } else {
+            self.decoders[index].candidate.reset();
         }
-        self.decoders[index].candidate.reset();
         Ok(())
     }
 
-    fn is_shifted_artifact(&self, index: usize) -> bool {
+    fn should_suppress(&self, index: usize) -> bool {
         let decoder = &self.decoders[index];
         if decoder.encoding == Encoding::ASCII || decoder.candidate.open.is_none() {
             return false;
         }
-        self.decoders
-            .iter()
-            .enumerate()
-            .any(|(other_index, other)| {
-                other_index != index
-                    && other.encoding != Encoding::ASCII
-                    && other.candidate.open.is_some()
-                    && is_artifact_of(&other.candidate, &decoder.candidate)
-            })
+        let candidate = CandidateRange::from(&decoder.candidate);
+        self.last_ascii
+            .is_some_and(|ascii| ascii_suppresses(ascii, candidate))
+            || self
+                .decoders
+                .iter()
+                .enumerate()
+                .any(|(other_index, other)| {
+                    other_index != index
+                        && other.candidate.open.is_some()
+                        && self.suppresses(other_index, index)
+                })
     }
 
-    fn finish_eof(&mut self) -> Result<(), S::Error> {
-        let suppress = (0..self.decoders.len())
-            .map(|index| self.is_shifted_artifact(index))
-            .collect::<Vec<_>>();
-        for (index, suppress) in suppress.into_iter().enumerate() {
-            self.finish_candidate(index, suppress)?;
+    fn suppresses(&self, winner: usize, candidate: usize) -> bool {
+        let winner = &self.decoders[winner];
+        let candidate = &self.decoders[candidate];
+        if winner.candidate.open.is_none() || candidate.candidate.open.is_none() {
+            return false;
+        }
+        let winner_range = CandidateRange::from(&winner.candidate);
+        let candidate_range = CandidateRange::from(&candidate.candidate);
+        if winner.encoding == Encoding::ASCII {
+            candidate.encoding != Encoding::ASCII && ascii_suppresses(winner_range, candidate_range)
+        } else {
+            candidate.encoding != Encoding::ASCII
+                && utf16_suppresses_shifted(winner_range, candidate_range)
+        }
+    }
+
+    fn finish_eof(&mut self) -> Result<(), ScanError<S::Error>> {
+        for index in 0..self.decoders.len() {
+            self.finish_detected_candidate(index)?;
         }
         Ok(())
     }
 
-    fn abort_all(&mut self) -> Result<(), S::Error> {
-        let mut first_error = None;
+    fn abort_all(&mut self) -> Result<(), ScanError<S::Error>> {
         for decoder in &mut self.decoders {
             if let Some(open) = decoder.candidate.open.take() {
-                if let Err(error) = self.sink.abort(open.id) {
-                    if first_error.is_none() {
-                        first_error = Some(error);
-                    }
-                }
+                self.sink.abort(open.id).map_err(ScanError::Sink)?;
             }
             decoder.candidate.reset();
         }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        Ok(())
     }
 
-    fn abort_all_ignoring_errors(&mut self) {
-        for decoder in &mut self.decoders {
-            if let Some(open) = decoder.candidate.open.take() {
-                let _ = self.sink.abort(open.id);
-            }
-            decoder.candidate.reset();
+    fn terminate(&mut self, error: ScanError<S::Error>) -> ScanError<S::Error> {
+        match error {
+            ScanError::Sink(_) => error,
+            error => match self.abort_all() {
+                Ok(()) => error,
+                Err(sink_error) => sink_error,
+            },
         }
     }
+}
+
+impl From<&Candidate> for CandidateRange {
+    fn from(candidate: &Candidate) -> Self {
+        Self {
+            start: candidate.start,
+            end: candidate.end,
+            character_count: candidate.character_count,
+            ascii_character_count: candidate.ascii_character_count,
+        }
+    }
+}
+
+fn checked_increment(value: &mut u64, error: OverflowError) -> Result<(), OverflowError> {
+    match value.checked_add(1) {
+        Some(next) => {
+            *value = next;
+            Ok(())
+        }
+        None => Err(error),
+    }
+}
+
+fn ascii_suppresses(ascii: CandidateRange, utf16: CandidateRange) -> bool {
+    utf16.ascii_character_count != utf16.character_count
+        && ascii.start.abs_diff(utf16.start) <= 1
+        && ascii.end.abs_diff(utf16.end) <= 1
+}
+
+fn utf16_suppresses_shifted(winner: CandidateRange, candidate: CandidateRange) -> bool {
+    if winner.ascii_character_count != winner.character_count {
+        return false;
+    }
+    let shifted_suffix = winner.start.checked_add(1) == Some(candidate.start)
+        && candidate.end.checked_add(1) == Some(winner.end)
+        && candidate.character_count.checked_add(1) == Some(winner.character_count);
+    let non_ascii_copy = candidate.ascii_character_count != candidate.character_count
+        && winner.start.abs_diff(candidate.start) == 1
+        && winner.end.abs_diff(candidate.end) <= 1
+        && winner.character_count.abs_diff(candidate.character_count) <= 1;
+    shifted_suffix || non_ascii_copy
 }
 
 impl Decoder {
@@ -563,7 +704,7 @@ impl Decoder {
             return None;
         }
         let (first_offset, first) = first_byte.take()?;
-        debug_assert_eq!(first_offset + 1, offset);
+        debug_assert_eq!(first_offset.checked_add(1), Some(offset));
         let unit = if *big_endian {
             u16::from_be_bytes([first, byte])
         } else {
@@ -595,23 +736,82 @@ fn is_ascii_string_byte(byte: u8) -> bool {
     (b' '..=b'~').contains(&byte) || matches!(byte, b'\t' | b'\n' | b'\r')
 }
 
-fn is_shifted_suffix(other: &Candidate, candidate: &Candidate) -> bool {
-    other.ascii_character_count == other.character_count
-        && other.start.checked_add(1) == Some(candidate.start)
-        && other.end == candidate.end + 1
-        && other.character_count == candidate.character_count + 1
-}
+#[cfg(test)]
+mod tests {
+    use std::convert::Infallible;
 
-fn is_non_ascii_shifted_copy(other: &Candidate, candidate: &Candidate) -> bool {
-    other.ascii_character_count == other.character_count
-        && candidate.ascii_character_count != candidate.character_count
-        && other.start.abs_diff(candidate.start) == 1
-        && other.end.abs_diff(candidate.end) <= 1
-        && other.character_count.abs_diff(candidate.character_count) <= 1
-}
+    use super::*;
 
-fn is_artifact_of(other: &Candidate, candidate: &Candidate) -> bool {
-    other.open.is_some()
-        && candidate.open.is_some()
-        && (is_shifted_suffix(other, candidate) || is_non_ascii_shifted_copy(other, candidate))
+    struct NoopSink;
+
+    impl StringSink for NoopSink {
+        type Error = Infallible;
+
+        fn start(&mut self, _id: HitId, _hit: HitStart) -> Result<SinkControl, Self::Error> {
+            Ok(SinkControl::Continue)
+        }
+
+        fn chunk(&mut self, _id: HitId, _text: &str) -> Result<SinkControl, Self::Error> {
+            Ok(SinkControl::Continue)
+        }
+
+        fn finish(&mut self, _id: HitId, _hit: HitFinish) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn abort(&mut self, _id: HitId) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn hit_id_overflow_is_typed_and_happens_before_start() {
+        let options = ScanOptions::new(1, [Encoding::ASCII]).unwrap();
+        let mut sink = NoopSink;
+        let mut scanner = Scanner::new(&options, &mut sink);
+        scanner.next_hit_id = u64::MAX;
+
+        assert!(matches!(
+            scanner.consume(0, b'A'),
+            Err(ScanError::Overflow(OverflowError::HitId))
+        ));
+        assert!(scanner.decoders[0].candidate.open.is_none());
+    }
+
+    #[test]
+    fn decoded_length_overflow_is_typed() {
+        let options = ScanOptions::new(2, [Encoding::ASCII]).unwrap();
+        let mut sink = NoopSink;
+        let mut scanner = Scanner::new(&options, &mut sink);
+        scanner.decoders[0].candidate.decoded_utf8_length = u64::MAX;
+
+        assert!(matches!(
+            scanner.add_character(0, 0, 1, 'A'),
+            Err(ScanError::Overflow(OverflowError::DecodedUtf8Length))
+        ));
+    }
+
+    #[test]
+    fn checked_increment_reports_its_counter() {
+        let mut value = u64::MAX;
+        assert_eq!(
+            checked_increment(&mut value, OverflowError::CandidateCount),
+            Err(OverflowError::CandidateCount)
+        );
+    }
+
+    #[test]
+    fn completed_candidate_counter_overflow_is_typed() {
+        let options = ScanOptions::new(1, [Encoding::ASCII]).unwrap();
+        let mut sink = NoopSink;
+        let mut scanner = Scanner::new(&options, &mut sink);
+        scanner.summary.candidate_count = u64::MAX;
+        scanner.consume(0, b'A').unwrap();
+
+        assert!(matches!(
+            scanner.consume(1, 0),
+            Err(ScanError::Overflow(OverflowError::CandidateCount))
+        ));
+        assert!(scanner.decoders[0].candidate.open.is_none());
+    }
 }

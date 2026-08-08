@@ -1,7 +1,6 @@
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
-use std::error::Error;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -58,27 +57,29 @@ fn strings(
             .iter()
             .map(|e| RustEncoding::from_str(e))
             .collect::<Result<Vec<RustEncoding>, _>>()?;
-        let result: Result<Vec<(String, u64)>, Box<dyn Error>>;
-        if let Some(file_path) = file_path {
+        let result = if let Some(file_path) = file_path {
             let strings_config = RustFileConfig::new(&file_path)
                 .with_min_length(min_length)
                 .with_encodings(encodings)
                 .with_buffer_size(buffer_size);
-            result = r_strings(&strings_config);
+            r_strings(&strings_config)
         } else if let Some(bytes) = bytes {
             let strings_config = RustBytesConfig::new(bytes)
                 .with_min_length(min_length)
                 .with_encodings(encodings);
-            result = r_strings(&strings_config);
+            r_strings(&strings_config)
         } else {
             return Err(StringsException::new_err(
                 "You must specify file_path or bytes",
             ));
-        }
-        if let Err(error_message) = result {
-            return Err(StringsException::new_err(format!("{}", error_message)));
-        }
-        Ok(result.unwrap())
+        };
+        result
+            .map(|hits| {
+                hits.into_iter()
+                    .map(|hit| (hit.text, hit.start.offset.get()))
+                    .collect()
+            })
+            .map_err(|error| StringsException::new_err(error.to_string()))
     })
 }
 
@@ -123,27 +124,23 @@ fn dump_strings(
             .iter()
             .map(|e| RustEncoding::from_str(e))
             .collect::<Result<Vec<RustEncoding>, _>>()?;
-        let result: Result<(), Box<dyn Error>>;
-        if let Some(file_path) = file_path {
+        let result = if let Some(file_path) = file_path {
             let strings_config = RustFileConfig::new(&file_path)
                 .with_min_length(min_length)
                 .with_encodings(encodings)
                 .with_buffer_size(buffer_size);
-            result = r_dump_strings(&strings_config, output_file);
+            r_dump_strings(&strings_config, output_file)
         } else if let Some(bytes) = bytes {
             let strings_config = RustBytesConfig::new(bytes)
                 .with_min_length(min_length)
                 .with_encodings(encodings);
-            result = r_dump_strings(&strings_config, output_file);
+            r_dump_strings(&strings_config, output_file)
         } else {
             return Err(StringsException::new_err(
                 "You must specify file_path or bytes",
             ));
-        }
-        if let Err(error_message) = result {
-            return Err(StringsException::new_err(format!("{}", error_message)));
-        }
-        Ok(())
+        };
+        result.map_err(|error| StringsException::new_err(error.to_string()))
     })
 }
 

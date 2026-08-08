@@ -88,7 +88,9 @@ let extracted_strings = strings(&config);
 
 let config = BytesConfig::new(b"test\x00".to_vec());
 let extracted_strings = strings(&config);
-assert_eq!(vec![(String::from("test"), 0)], extracted_strings.unwrap());
+let hit = extracted_strings.unwrap().remove(0);
+assert_eq!(hit.text, "test");
+assert_eq!(hit.start.offset.get(), 0);
 
 // Dump strings into `strings.json` file.
 let config = BytesConfig::new(b"test\x00".to_vec());
@@ -99,6 +101,25 @@ Use `scan` when the caller must own input and output streaming. Sink callbacks
 can overlap, so each callback includes a stable `HitId`. A sink can return
 `SkipCurrent` to stop text delivery while the scanner continues to count the
 candidate and scan the input.
+
+### Ordering and suppression
+
+The scanner processes encodings in option order. UTF-16 alignment zero runs
+before alignment one. It assigns hit IDs when candidates reach the minimum.
+
+Chunks follow their start immediately. At a shared boundary, the scanner
+aborts known artifacts before it finishes the preferred hit. At EOF, it closes
+decoders in the same order.
+
+ASCII wins when a UTF-16 view has the same byte range, within one alignment
+byte, and contains non-ASCII scalars. This removes UTF-16 garbage from normal
+ASCII. It does not suppress null-interleaved or high-byte UTF-16 text.
+
+An all-ASCII UTF-16 hit wins over its one-byte shifted suffix and non-ASCII
+shifted copy. Other overlapping Unicode hits remain because the bytes do not
+prove which interpretation is intentional.
+
+If any sink callback fails, scanning stops without another sink callback.
 
 ## Contributing
 Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.

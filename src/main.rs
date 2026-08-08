@@ -77,11 +77,11 @@ fn main() {
         }
     }
     .expect("Something went wrong!");
-    for (string, offset) in extracted_strings {
+    for hit in extracted_strings {
         if options.offset {
-            println!("{:10}: {}", offset, string);
+            println!("{:10}: {}", hit.start.offset.get(), hit.text);
         } else {
-            println!("{}", string);
+            println!("{}", hit.text);
         }
     }
 }
