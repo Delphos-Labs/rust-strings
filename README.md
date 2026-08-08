@@ -95,6 +95,11 @@ let config = BytesConfig::new(b"test\x00".to_vec());
 dump_strings(&config, PathBuf::from("strings.json"));
 ```
 
+Use `scan` when the caller must own input and output streaming. Sink callbacks
+can overlap, so each callback includes a stable `HitId`. A sink can return
+`SkipCurrent` to stop text delivery while the scanner continues to count the
+candidate and scan the input.
+
 ## Contributing
 Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.
 

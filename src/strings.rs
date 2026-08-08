@@ -1,46 +1,46 @@
-use std::cell::RefCell;
+use std::collections::HashMap;
+use std::convert::Infallible;
 use std::error::Error;
 use std::fs::File;
-use std::io::{BufReader, Read};
-use std::iter::Iterator;
+use std::io::{self, BufReader, Cursor, Write};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
-use std::result::Result;
 
-use crate::encodings::Encoding;
-use crate::strings_extractor::{new_strings_extractor, StringsExtractor};
-use crate::strings_writer::{JsonWriter, StringWriter, VectorWriter};
-use crate::ErrorResult;
+use crate::{scan, Encoding, HitFinish, HitId, HitStart, ScanOptions, SinkControl, StringSink};
 
 const DEFAULT_MIN_LENGTH: usize = 3;
 const DEFAULT_ENCODINGS: [Encoding; 2] = [Encoding::ASCII, Encoding::UTF16LE];
 
 pub trait Config {
     #[doc(hidden)]
-    fn consume<F>(&self, func: F) -> ErrorResult
+    fn scan_with<S>(&self, sink: &mut S) -> Result<(), Box<dyn Error>>
     where
-        F: FnMut(usize, u8) -> ErrorResult;
+        S: StringSink,
+        S::Error: Error + 'static;
+
     #[doc(hidden)]
     fn get_min_length(&self) -> usize;
+
     #[doc(hidden)]
     fn get_encodings(&self) -> Vec<Encoding>;
 }
 
-macro_rules! impl_config {
+macro_rules! impl_config_accessors {
     () => {
         fn get_min_length(&self) -> usize {
             self.min_length
         }
+
         fn get_encodings(&self) -> Vec<Encoding> {
             if self.encodings.is_empty() {
-                return DEFAULT_ENCODINGS.to_vec();
+                DEFAULT_ENCODINGS.to_vec()
+            } else {
+                self.encodings.clone()
             }
-            self.encodings.clone()
         }
     };
 }
 
-macro_rules! impl_default {
+macro_rules! impl_builders {
     () => {
         pub fn with_min_length(mut self, min_length: usize) -> Self {
             self.min_length = min_length;
@@ -70,11 +70,11 @@ impl<'a> FileConfig<'a> {
     const DEFAULT_BUFFER_SIZE: usize = 1024 * 1024;
 
     pub fn new(file_path: &'a Path) -> Self {
-        FileConfig {
+        Self {
             file_path,
             min_length: DEFAULT_MIN_LENGTH,
-            encodings: vec![],
-            buffer_size: FileConfig::DEFAULT_BUFFER_SIZE,
+            encodings: Vec::new(),
+            buffer_size: Self::DEFAULT_BUFFER_SIZE,
         }
     }
 
@@ -83,28 +83,23 @@ impl<'a> FileConfig<'a> {
         self
     }
 
-    impl_default!();
+    impl_builders!();
 }
 
-impl<'a> Config for FileConfig<'a> {
-    fn consume<F>(&self, mut func: F) -> ErrorResult
+impl Config for FileConfig<'_> {
+    fn scan_with<S>(&self, sink: &mut S) -> Result<(), Box<dyn Error>>
     where
-        F: FnMut(usize, u8) -> ErrorResult,
+        S: StringSink,
+        S::Error: Error + 'static,
     {
-        let file_result = File::open(self.file_path);
-        if let Err(err) = file_result {
-            return Err(Box::new(err));
-        }
-        let file = file_result.unwrap();
-        let buf_reader = BufReader::with_capacity(self.buffer_size, file);
-        buf_reader
-            .bytes()
-            .enumerate()
-            .try_for_each(|(i, b)| func(i, b.unwrap()))?;
+        let options = ScanOptions::new(self.get_min_length(), self.get_encodings())?;
+        let file = File::open(self.file_path)?;
+        let mut reader = BufReader::with_capacity(self.buffer_size, file);
+        scan(&mut reader, &options, sink)?;
         Ok(())
     }
 
-    impl_config!();
+    impl_config_accessors!();
 }
 
 pub struct StdinConfig {
@@ -123,10 +118,10 @@ impl StdinConfig {
     const DEFAULT_BUFFER_SIZE: usize = 1024 * 1024;
 
     pub fn new() -> Self {
-        StdinConfig {
+        Self {
             min_length: DEFAULT_MIN_LENGTH,
-            encodings: vec![],
-            buffer_size: StdinConfig::DEFAULT_BUFFER_SIZE,
+            encodings: Vec::new(),
+            buffer_size: Self::DEFAULT_BUFFER_SIZE,
         }
     }
 
@@ -135,23 +130,23 @@ impl StdinConfig {
         self
     }
 
-    impl_default!();
+    impl_builders!();
 }
 
 impl Config for StdinConfig {
-    fn consume<F>(&self, mut func: F) -> ErrorResult
+    fn scan_with<S>(&self, sink: &mut S) -> Result<(), Box<dyn Error>>
     where
-        F: FnMut(usize, u8) -> ErrorResult,
+        S: StringSink,
+        S::Error: Error + 'static,
     {
-        let buf_reader = BufReader::with_capacity(self.buffer_size, std::io::stdin());
-        buf_reader
-            .bytes()
-            .enumerate()
-            .try_for_each(|(i, b)| func(i, b.unwrap()))?;
+        let options = ScanOptions::new(self.get_min_length(), self.get_encodings())?;
+        let stdin = io::stdin();
+        let mut reader = BufReader::with_capacity(self.buffer_size, stdin.lock());
+        scan(&mut reader, &options, sink)?;
         Ok(())
     }
 
-    impl_config!();
+    impl_config_accessors!();
 }
 
 pub struct BytesConfig {
@@ -162,111 +157,110 @@ pub struct BytesConfig {
 
 impl BytesConfig {
     pub fn new(bytes: Vec<u8>) -> Self {
-        BytesConfig {
+        Self {
             bytes,
             min_length: DEFAULT_MIN_LENGTH,
-            encodings: vec![],
+            encodings: Vec::new(),
         }
     }
 
-    impl_default!();
+    impl_builders!();
 }
 
 impl Config for BytesConfig {
-    fn consume<F>(&self, mut func: F) -> ErrorResult
+    fn scan_with<S>(&self, sink: &mut S) -> Result<(), Box<dyn Error>>
     where
-        F: FnMut(usize, u8) -> ErrorResult,
+        S: StringSink,
+        S::Error: Error + 'static,
     {
-        self.bytes
-            .iter()
-            .enumerate()
-            .try_for_each(|(i, b)| func(i, *b))?;
+        let options = ScanOptions::new(self.get_min_length(), self.get_encodings())?;
+        let mut reader = Cursor::new(self.bytes.as_slice());
+        scan(&mut reader, &options, sink)?;
         Ok(())
     }
 
-    impl_config!();
+    impl_config_accessors!();
 }
 
-fn _strings<T: Config, W: StringWriter>(
-    strings_config: &T,
-    strings_writer: Rc<RefCell<W>>,
-) -> ErrorResult {
-    let min_length = strings_config.get_min_length();
-    let mut strings_extractors: Vec<Box<dyn StringsExtractor>> = strings_config
-        .get_encodings()
-        .iter()
-        .map(|e| new_strings_extractor(strings_writer.clone(), *e, min_length))
-        .collect();
-    strings_config.consume(|offset: usize, c: u8| {
-        strings_extractors
-            .iter_mut()
-            .try_for_each(|strings_extractor| -> ErrorResult {
-                if strings_extractor.can_consume(c) {
-                    strings_extractor.consume(offset as u64, c)?;
-                } else {
-                    strings_extractor.stop_consume()?;
-                }
-                Ok(())
-            })?;
+#[derive(Default)]
+struct VectorSink {
+    active: HashMap<HitId, (String, u64)>,
+    complete: Vec<(HitId, String, u64)>,
+}
+
+impl StringSink for VectorSink {
+    type Error = Infallible;
+
+    fn start(&mut self, id: HitId, hit: HitStart) -> Result<SinkControl, Self::Error> {
+        self.active.insert(id, (String::new(), hit.offset.get()));
+        Ok(SinkControl::Continue)
+    }
+
+    fn chunk(&mut self, id: HitId, text: &str) -> Result<SinkControl, Self::Error> {
+        self.active
+            .get_mut(&id)
+            .expect("active hit")
+            .0
+            .push_str(text);
+        Ok(SinkControl::Continue)
+    }
+
+    fn finish(&mut self, id: HitId, _hit: HitFinish) -> Result<(), Self::Error> {
+        let (text, offset) = self.active.remove(&id).expect("active hit");
+        self.complete.push((id, text, offset));
         Ok(())
-    })?;
-    strings_extractors
-        .iter_mut()
-        .try_for_each(|strings_extractor| -> ErrorResult {
-            strings_extractor.stop_consume()?;
-            Ok(())
-        })?;
+    }
+
+    fn abort(&mut self, id: HitId) -> Result<(), Self::Error> {
+        self.active.remove(&id);
+        Ok(())
+    }
+}
+
+pub fn strings<T: Config>(config: &T) -> Result<Vec<(String, u64)>, Box<dyn Error>> {
+    let mut sink = VectorSink::default();
+    config.scan_with(&mut sink)?;
+    sink.complete
+        .sort_by_key(|(id, _, offset)| (*offset, id.get()));
+    Ok(sink
+        .complete
+        .into_iter()
+        .map(|(_, text, offset)| (text, offset))
+        .collect())
+}
+
+pub fn dump_strings<T: Config>(config: &T, output: PathBuf) -> Result<(), Box<dyn Error>> {
+    let strings = strings(config)?;
+    let mut writer = File::create(output)?;
+    writer.write_all(b"[")?;
+    for (index, (text, offset)) in strings.iter().enumerate() {
+        if index != 0 {
+            writer.write_all(b",")?;
+        }
+        writer.write_all(b"[\"")?;
+        write_json_string_contents(&mut writer, text)?;
+        write!(writer, "\",{offset}]")?;
+    }
+    writer.write_all(b"]")?;
     Ok(())
 }
 
-/// Extract strings from binary data.
-///
-/// Examples:
-/// ```
-/// use rust_strings::{FileConfig, BytesConfig, strings, Encoding};
-/// use std::path::Path;
-///
-/// let config = FileConfig::new(Path::new("/bin/ls")).with_min_length(5);
-/// let extracted_strings = strings(&config);
-///
-/// // Extract utf16le strings
-/// let config = FileConfig::new(Path::new("C:\\Windows\\notepad.exe"))
-///     .with_min_length(15)
-///     .with_encoding(Encoding::UTF16LE);
-/// let extracted_strings = strings(&config);
-///
-/// // Extract ascii and utf16le strings
-/// let config = FileConfig::new(Path::new("C:\\Windows\\notepad.exe"))
-///     .with_min_length(15)
-///     .with_encoding(Encoding::ASCII)
-///     .with_encoding(Encoding::UTF16LE);
-/// let extracted_strings = strings(&config);
-///
-/// let config = BytesConfig::new(b"test\x00".to_vec());
-/// let extracted_strings = strings(&config);
-/// assert_eq!(vec![(String::from("test"), 0)], extracted_strings.unwrap());
-/// ```
-pub fn strings<T: Config>(strings_config: &T) -> Result<Vec<(String, u64)>, Box<dyn Error>> {
-    let vector_writer = Rc::new(RefCell::new(VectorWriter::new()));
-    _strings(strings_config, vector_writer.clone())?;
-    let result = Ok(vector_writer.borrow_mut().get_strings());
-    result
-}
-
-/// Dump strings from binary data to json file.
-///
-/// Examples:
-/// ```
-/// use std::path::PathBuf;
-/// use rust_strings::{BytesConfig, dump_strings};
-///
-/// let config = BytesConfig::new(b"test\x00".to_vec());
-/// dump_strings(&config, PathBuf::from("strings.json"));
-///
-pub fn dump_strings<T: Config>(strings_config: &T, output: PathBuf) -> ErrorResult {
-    let output_file = File::create(output)?;
-    let vector_writer = Rc::new(RefCell::new(JsonWriter::new(output_file)));
-    _strings(strings_config, vector_writer.clone())?;
-    vector_writer.borrow_mut().finish()?;
+fn write_json_string_contents(writer: &mut impl Write, text: &str) -> io::Result<()> {
+    for character in text.chars() {
+        match character {
+            '"' => writer.write_all(b"\\\"")?,
+            '\\' => writer.write_all(b"\\\\")?,
+            '\n' => writer.write_all(b"\\n")?,
+            '\r' => writer.write_all(b"\\r")?,
+            '\t' => writer.write_all(b"\\t")?,
+            character if character <= '\u{1f}' => {
+                write!(writer, "\\u{:04x}", u32::from(character))?
+            }
+            character => {
+                let mut encoded = [0_u8; 4];
+                writer.write_all(character.encode_utf8(&mut encoded).as_bytes())?;
+            }
+        }
+    }
     Ok(())
 }

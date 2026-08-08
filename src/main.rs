@@ -16,7 +16,7 @@ struct Opts {
     /// min length of string
     #[clap(short, long, default_value = "3")]
     min_length: usize,
-    /// encoding of string (ascii, utf16le, utf16be). If not specified, extracts both ascii and utf16le
+    /// encoding of string (ascii, utf16le, utf16be). Defaults to ascii and utf16le
     #[clap(short, long)]
     encoding: Option<String>,
     #[clap(short, long)]
@@ -24,7 +24,7 @@ struct Opts {
 }
 
 fn get_file_path(options: &Opts) -> String {
-    if matches!(options.file_path_arg, Some(_)) && matches!(options.file_path_flag, Some(_)) {
+    if options.file_path_arg.is_some() && options.file_path_flag.is_some() {
         eprintln!("You can't specify file path as argument and as flag together");
         exit(1);
     }

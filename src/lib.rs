@@ -33,16 +33,15 @@
 //! dump_strings(&config, PathBuf::from("strings.json"));
 //! ```
 
-use std::error::Error;
-
 mod encodings;
+mod scanner;
 mod strings;
-mod strings_extractor;
-mod strings_writer;
-
-type ErrorResult = Result<(), Box<dyn Error>>;
 
 pub use encodings::{Encoding, EncodingNotFoundError};
+pub use scanner::{
+    scan, HitFinish, HitId, HitStart, ScanError, ScanOptions, ScanOptionsError, ScanSummary,
+    SinkControl, SourceLength, SourceOffset, StringSink,
+};
 pub use strings::{dump_strings, strings, BytesConfig, Config, FileConfig, StdinConfig};
 
 #[cfg(feature = "python_bindings")]

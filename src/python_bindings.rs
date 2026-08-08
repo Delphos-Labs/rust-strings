@@ -8,7 +8,7 @@ use std::str::FromStr;
 use crate::encodings::EncodingNotFoundError;
 use crate::{
     dump_strings as r_dump_strings, strings as r_strings, BytesConfig as RustBytesConfig,
-    Encoding as RustEncoding, ErrorResult, FileConfig as RustFileConfig,
+    Encoding as RustEncoding, FileConfig as RustFileConfig,
 };
 
 create_exception!(pystrings, StringsException, PyException);
@@ -49,7 +49,7 @@ fn strings(
     buffer_size: usize,
 ) -> PyResult<Vec<(String, u64)>> {
     py.allow_threads(|| {
-        if matches!(file_path, Some(_)) && matches!(bytes, Some(_)) {
+        if file_path.is_some() && bytes.is_some() {
             return Err(StringsException::new_err(
                 "You can't specify file_path and bytes",
             ));
@@ -114,7 +114,7 @@ fn dump_strings(
     buffer_size: usize,
 ) -> PyResult<()> {
     py.allow_threads(|| {
-        if matches!(file_path, Some(_)) && matches!(bytes, Some(_)) {
+        if file_path.is_some() && bytes.is_some() {
             return Err(StringsException::new_err(
                 "You can't specify file_path and bytes",
             ));
@@ -123,7 +123,7 @@ fn dump_strings(
             .iter()
             .map(|e| RustEncoding::from_str(e))
             .collect::<Result<Vec<RustEncoding>, _>>()?;
-        let result: ErrorResult;
+        let result: Result<(), Box<dyn Error>>;
         if let Some(file_path) = file_path {
             let strings_config = RustFileConfig::new(&file_path)
                 .with_min_length(min_length)
