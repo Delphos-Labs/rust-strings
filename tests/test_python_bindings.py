@@ -75,7 +75,7 @@ def test_multiple_encodings():
 
 def test_json_dump(temp_file: Path):
     rust_strings.dump_strings(temp_file, bytes=b'\x00\x00test"\n\tmore\x00\x00')
-    assert json.loads(temp_file.read_text()) == [['test"\n\tmore', 2]]
+    assert json.loads(temp_file.read_text()) == [['test"', 2], ["\tmore", 8]]
 
 
 def test_json_dump_multiple_strings(temp_file: Path):
@@ -83,6 +83,7 @@ def test_json_dump_multiple_strings(temp_file: Path):
         temp_file, bytes=b'\x00\x00test"\n\tmore\x00\x00more text over here'
     )
     assert json.loads(temp_file.read_text()) == [
-        ['test"\n\tmore', 2],
+        ['test"', 2],
+        ["\tmore", 8],
         ["more text over here", 15],
     ]

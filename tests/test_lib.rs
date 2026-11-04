@@ -162,7 +162,7 @@ fn test_json_dump() {
     dump_strings(&config, path).unwrap();
     let mut string = String::new();
     file.as_file().read_to_string(&mut string).unwrap();
-    assert_eq!(string, String::from("[[\"test\\\"\\n\\tmore\",2]]"));
+    assert_eq!(string, String::from("[[\"test\\\"\",2],[\"\\tmore\",8]]"));
 }
 
 #[test]
@@ -177,7 +177,7 @@ fn test_json_dump_multiple_strings() {
     file.as_file().read_to_string(&mut string).unwrap();
     assert_eq!(
         string,
-        String::from("[[\"test\\\"\\n\\tmore\",2],[\"more text over here\",15]]")
+        String::from("[[\"test\\\"\",2],[\"\\tmore\",8],[\"more text over here\",15]]")
     );
 }
 

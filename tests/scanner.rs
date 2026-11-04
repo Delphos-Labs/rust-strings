@@ -150,6 +150,42 @@ fn ascii_rejects_non_ascii_bytes() {
 }
 
 #[test]
+fn line_breaks_end_candidates_and_tabs_stay_inside() {
+    let mut reader = &b"echo one\r\necho two\n\tthree"[..];
+    let mut sink = CollectSink::default();
+    scan(&mut reader, &options(4, &[Encoding::ASCII]), &mut sink).unwrap();
+
+    matching_record(&sink, "echo one", 0);
+    matching_record(&sink, "echo two", 10);
+    matching_record(&sink, "\tthree", 19);
+    assert_eq!(sink.records.len(), 3, "{:?}", sink.records);
+
+    for (encoding, big_endian) in [(Encoding::UTF16LE, false), (Encoding::UTF16BE, true)] {
+        let bytes = utf16("line one\r\nline two", big_endian, 0);
+        let mut reader = bytes.as_slice();
+        let mut sink = CollectSink::default();
+        scan(&mut reader, &options(4, &[encoding]), &mut sink).unwrap();
+
+        assert_eq!(
+            matching_record(&sink, "line one", 0).start.encoding,
+            encoding
+        );
+        // "line one" and "\r\n" are ten UTF-16 code units.
+        assert_eq!(
+            matching_record(&sink, "line two", 20).start.encoding,
+            encoding
+        );
+        assert!(
+            sink.records
+                .iter()
+                .all(|record| !record.text.contains(['\n', '\r'])),
+            "{:?}",
+            sink.records
+        );
+    }
+}
+
+#[test]
 fn utf16_supports_unicode_surrogates_endianness_and_both_alignments() {
     let text = "Aé😀中";
     for (encoding, big_endian) in [(Encoding::UTF16LE, false), (Encoding::UTF16BE, true)] {

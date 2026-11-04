@@ -24,7 +24,7 @@ pip install rust-strings
 
 ```bash
 [dependencies]
-rust-strings = "0.7.0"
+rust-strings = "0.8.0"
 ```
 
 ## Usage
@@ -96,6 +96,13 @@ Use `scan` when the caller must own input and output streaming. Sink callbacks
 can overlap, so each callback includes a stable `HitId`. A sink can return
 `SkipCurrent` to stop text delivery while the scanner continues to count the
 candidate and scan the input.
+
+### String characters
+
+A string holds printable characters and tab. Other control characters end it,
+including line feed and carriage return, as in GNU `strings` without
+`--include-all-whitespace`. Each line of embedded text is therefore its own hit
+with its own source offset.
 
 ### Ordering and suppression
 

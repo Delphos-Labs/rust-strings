@@ -792,12 +792,16 @@ impl Decoder {
     }
 }
 
+/// Whether `character` can be part of a decoded string: any non-control character, plus tab.
+/// A line break ends the string, as in GNU `strings` without `--include-all-whitespace`, so each
+/// line of embedded text is its own hit with its own source offset.
 fn is_string_character(character: char) -> bool {
-    !character.is_control() || matches!(character, '\t' | '\n' | '\r')
+    !character.is_control() || character == '\t'
 }
 
+/// The ASCII form of [`is_string_character`]: printable ASCII plus tab.
 fn is_ascii_string_byte(byte: u8) -> bool {
-    (b' '..=b'~').contains(&byte) || matches!(byte, b'\t' | b'\n' | b'\r')
+    (b' '..=b'~').contains(&byte) || byte == b'\t'
 }
 
 #[cfg(test)]
