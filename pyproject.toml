@@ -5,8 +5,8 @@ build-backend = "maturin"
 
 [project]
 name = "rust-strings"
-version = "0.8.0"
-description = "Streaming ASCII and Unicode UTF-16 string extraction for binary data"
+version = "0.9.0"
+description = "Streaming ASCII, UTF-8, and UTF-16 string extraction for binary data"
 authors = [
     {name = "Delphos Labs"},
 ]

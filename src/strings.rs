@@ -233,6 +233,9 @@ impl StringSink for CollectSink {
     }
 }
 
+/// Collects every finished hit, shadowed or not, ordered by source offset.
+///
+/// Check `hit.finish.shadowed` to keep only the winning reading of each byte range.
 pub fn strings<T: Config>(config: &T) -> Result<Vec<StringHit>, ScanError<Infallible>> {
     let mut sink = CollectSink::default();
     config.scan_with(&mut sink)?;
@@ -279,7 +282,7 @@ impl<W: Write> StringSink for JsonSink<W> {
         Ok(SinkControl::Continue)
     }
 
-    fn finish(&mut self, id: HitId, _hit: HitFinish) -> Result<(), Self::Error> {
+    fn finish(&mut self, id: HitId, hit: HitFinish) -> Result<(), Self::Error> {
         let (start, text) = self.active.remove(&id).expect("active hit");
         if !self.first {
             self.writer.write_all(b",")?;
@@ -287,7 +290,7 @@ impl<W: Write> StringSink for JsonSink<W> {
         self.first = false;
         self.writer.write_all(b"[\"")?;
         write_json_string_contents(&mut self.writer, &text)?;
-        write!(self.writer, "\",{}]", start.offset.get())?;
+        write!(self.writer, "\",{},{}]", start.offset.get(), hit.shadowed)?;
         Ok(())
     }
 
@@ -297,6 +300,9 @@ impl<W: Write> StringSink for JsonSink<W> {
     }
 }
 
+/// Writes every finished hit as a JSON array of `[text, offset, shadowed]` arrays.
+///
+/// Each hit is written when it finishes, so the output follows finish order.
 pub fn dump_strings<T: Config>(config: &T, output: PathBuf) -> Result<(), ScanError<io::Error>> {
     let file = File::create(output).map_err(ScanError::Sink)?;
     let mut sink = JsonSink::new(file).map_err(ScanError::Sink)?;

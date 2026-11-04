@@ -58,6 +58,13 @@ pub struct HitFinish {
     pub character_count: u64,
     /// The complete decoded text length in UTF-8 bytes.
     pub decoded_utf8_length: u64,
+    /// Whether another reading of the same or nearly the same source bytes won.
+    ///
+    /// The winner can itself be shadowed by a third reading, but every such chain ends at an
+    /// unshadowed hit finished in the same scan. A shadowed hit ends when its winner ends, so it
+    /// holds only the characters decoded until then, and its decoder continues with a fresh
+    /// candidate.
+    pub shadowed: bool,
 }
 
 /// Controls delivery for the hit associated with the current callback.
@@ -73,6 +80,8 @@ pub enum SinkControl {
 ///
 /// While callbacks succeed, `start` is followed by one `finish` or `abort`
 /// with the same [`HitId`]. A hit is provisional until `finish` succeeds.
+/// The scanner aborts a hit only when it is an all-ASCII UTF-8 copy of the
+/// ASCII decoder's hit, or when the reader or a counter fails.
 /// After any callback returns an error, the scanner makes no more callbacks.
 pub trait StringSink {
     /// An error returned by this sink.
@@ -201,7 +210,8 @@ pub enum OverflowError {
     DecodedUtf8Length,
     CandidateCount,
     SkippedCandidateCount,
-    SuppressedCandidateCount,
+    ShadowedCandidateCount,
+    DuplicateCandidateCount,
 }
 
 impl fmt::Display for OverflowError {
@@ -217,12 +227,15 @@ impl Error for OverflowError {}
 pub struct ScanSummary {
     /// The number of source bytes consumed.
     pub bytes_read: u64,
-    /// The number of candidates completed through `StringSink::finish`.
+    /// The unshadowed candidates completed through `StringSink::finish`.
     pub candidate_count: u64,
-    /// The completed candidates for which the sink skipped text.
+    /// The completed candidates, shadowed or not, for which the sink skipped text.
     pub skipped_candidate_count: u64,
-    /// The provisional shifted UTF-16 artifacts discarded through `abort`.
-    pub suppressed_candidate_count: u64,
+    /// The candidates completed through `StringSink::finish` with `HitFinish::shadowed` set.
+    pub shadowed_candidate_count: u64,
+    /// The all-ASCII UTF-8 candidates discarded through `StringSink::abort` because the ASCII
+    /// decoder reports the same text at the same offset.
+    pub duplicate_candidate_count: u64,
 }
 
 #[derive(Debug)]
@@ -269,12 +282,40 @@ struct OpenHit {
 #[derive(Debug)]
 enum DecoderKind {
     Ascii,
+    Utf8 {
+        pending: Option<Utf8Sequence>,
+    },
     Utf16 {
         big_endian: bool,
         alignment: u8,
         first_byte: Option<(u64, u8)>,
         high_surrogate: Option<(u64, u16)>,
     },
+}
+
+/// An incomplete UTF-8 sequence whose bytes so far are a well-formed prefix.
+#[derive(Debug, Copy, Clone)]
+struct Utf8Sequence {
+    start: u64,
+    value: u32,
+    remaining: u8,
+    /// The inclusive range for the next continuation byte, from Unicode Table 3-7.
+    next: (u8, u8),
+}
+
+/// What one byte completes in the UTF-8 decoder.
+#[derive(Debug, Copy, Clone)]
+enum Utf8Step {
+    /// The byte extends an incomplete sequence.
+    Pending,
+    /// The byte completes a scalar value that starts at `offset`.
+    Scalar {
+        offset: u64,
+        width: u64,
+        character: char,
+    },
+    /// The byte cannot start a well-formed sequence.
+    IllFormed,
 }
 
 #[derive(Debug)]
@@ -290,6 +331,8 @@ struct Scanner<'a, S> {
     decoders: Vec<Decoder>,
     next_hit_id: u64,
     summary: ScanSummary,
+    /// Whether the ASCII decoder runs, so an all-ASCII UTF-8 candidate duplicates its hit.
+    ascii_selected: bool,
     last_ascii: Option<CandidateRange>,
     last_utf16: Vec<Option<CandidateRange>>,
 }
@@ -357,6 +400,11 @@ impl<'a, S: StringSink> Scanner<'a, S> {
                     kind: DecoderKind::Ascii,
                     candidate: Candidate::new(),
                 }),
+                Encoding::UTF8 => decoders.push(Decoder {
+                    encoding: *encoding,
+                    kind: DecoderKind::Utf8 { pending: None },
+                    candidate: Candidate::new(),
+                }),
                 Encoding::UTF16LE | Encoding::UTF16BE => {
                     for alignment in 0..=1 {
                         decoders.push(Decoder {
@@ -380,6 +428,7 @@ impl<'a, S: StringSink> Scanner<'a, S> {
             decoders,
             next_hit_id: 0,
             summary: ScanSummary::default(),
+            ascii_selected: options.encodings.contains(&Encoding::ASCII),
             last_ascii: None,
             last_utf16,
         }
@@ -393,6 +442,26 @@ impl<'a, S: StringSink> Scanner<'a, S> {
                         self.add_character(index, offset, 1, char::from(byte))?;
                     } else {
                         self.finish_detected_candidate(index)?;
+                    }
+                }
+                DecoderKind::Utf8 { .. } => {
+                    if self.decoders[index].interrupt_utf8_sequence(byte) {
+                        // The incomplete sequence is a maximal subpart of an ill-formed
+                        // sequence; this byte may start the next well-formed one.
+                        self.finish_detected_candidate(index)?;
+                    }
+                    match self.decoders[index].consume_utf8_byte(offset, byte) {
+                        Utf8Step::Pending => {}
+                        Utf8Step::Scalar {
+                            offset,
+                            width,
+                            character,
+                        } if is_string_character(character) => {
+                            self.add_character(index, offset, width, character)?;
+                        }
+                        Utf8Step::Scalar { .. } | Utf8Step::IllFormed => {
+                            self.finish_detected_candidate(index)?;
+                        }
                     }
                 }
                 DecoderKind::Utf16 { .. } => {
@@ -520,83 +589,98 @@ impl<'a, S: StringSink> Scanner<'a, S> {
     }
 
     fn finish_detected_candidate(&mut self, index: usize) -> Result<(), ScanError<S::Error>> {
-        let suppress = self.should_suppress(index);
-        if !suppress {
-            let artifacts = (0..self.decoders.len())
-                .filter(|other_index| *other_index != index && self.suppresses(index, *other_index))
+        let shadowed = self.is_shadowed(index);
+        if !shadowed {
+            let losers = (0..self.decoders.len())
+                .filter(|other_index| *other_index != index && self.shadows(index, *other_index))
                 .collect::<Vec<_>>();
-            for artifact in artifacts {
-                self.finish_candidate(artifact, true)?;
+            for loser in losers {
+                self.finish_candidate(loser, true)?;
             }
         }
-        self.finish_candidate(index, suppress)
+        self.finish_candidate(index, shadowed)
     }
 
     fn finish_candidate(
         &mut self,
         index: usize,
-        suppress: bool,
+        shadowed: bool,
     ) -> Result<(), ScanError<S::Error>> {
-        let open = self.decoders[index].candidate.open;
-        if let Some(open) = open {
-            if suppress {
-                self.sink.abort(open.id).map_err(ScanError::Sink)?;
-                self.decoders[index].candidate.reset();
-                checked_increment(
-                    &mut self.summary.suppressed_candidate_count,
-                    OverflowError::SuppressedCandidateCount,
-                )
-                .map_err(ScanError::Overflow)?;
-            } else {
-                let candidate = &self.decoders[index].candidate;
-                let source_length = candidate
-                    .end
-                    .checked_sub(candidate.start)
-                    .ok_or(ScanError::Overflow(OverflowError::SourceEnd))?;
-                let range = CandidateRange::from(candidate);
-                self.sink
-                    .finish(
-                        open.id,
-                        HitFinish {
-                            source_length: SourceLength(source_length),
-                            character_count: candidate.character_count,
-                            decoded_utf8_length: candidate.decoded_utf8_length,
-                        },
-                    )
-                    .map_err(ScanError::Sink)?;
-                self.decoders[index].candidate.reset();
-                if self.decoders[index].encoding == Encoding::ASCII {
-                    self.last_ascii = Some(range);
-                } else {
-                    self.last_utf16[index] = Some(range);
-                }
-                checked_increment(
-                    &mut self.summary.candidate_count,
-                    OverflowError::CandidateCount,
-                )
-                .map_err(ScanError::Overflow)?;
-                if open.skipped {
-                    checked_increment(
-                        &mut self.summary.skipped_candidate_count,
-                        OverflowError::SkippedCandidateCount,
-                    )
-                    .map_err(ScanError::Overflow)?;
-                }
-            }
-        } else {
+        let Some(open) = self.decoders[index].candidate.open else {
             self.decoders[index].candidate.reset();
+            return Ok(());
+        };
+        let encoding = self.decoders[index].encoding;
+        let candidate = &self.decoders[index].candidate;
+        if encoding == Encoding::UTF8
+            && self.ascii_selected
+            && candidate.ascii_character_count == candidate.character_count
+        {
+            // The ASCII decoder accepts the same bytes and ends at the same bytes, so it
+            // reports this text at this offset.
+            self.sink.abort(open.id).map_err(ScanError::Sink)?;
+            self.decoders[index].candidate.reset();
+            return checked_increment(
+                &mut self.summary.duplicate_candidate_count,
+                OverflowError::DuplicateCandidateCount,
+            )
+            .map_err(ScanError::Overflow);
+        }
+
+        let source_length = candidate
+            .end
+            .checked_sub(candidate.start)
+            .ok_or(ScanError::Overflow(OverflowError::SourceEnd))?;
+        let range = CandidateRange::from(candidate);
+        self.sink
+            .finish(
+                open.id,
+                HitFinish {
+                    source_length: SourceLength(source_length),
+                    character_count: candidate.character_count,
+                    decoded_utf8_length: candidate.decoded_utf8_length,
+                    shadowed,
+                },
+            )
+            .map_err(ScanError::Sink)?;
+        self.decoders[index].candidate.reset();
+        if shadowed {
+            checked_increment(
+                &mut self.summary.shadowed_candidate_count,
+                OverflowError::ShadowedCandidateCount,
+            )
+            .map_err(ScanError::Overflow)?;
+        } else {
+            // Only a winning reading is evidence for the next shadow decision.
+            match encoding {
+                Encoding::ASCII => self.last_ascii = Some(range),
+                Encoding::UTF16LE | Encoding::UTF16BE => self.last_utf16[index] = Some(range),
+                Encoding::UTF8 => {}
+            }
+            checked_increment(
+                &mut self.summary.candidate_count,
+                OverflowError::CandidateCount,
+            )
+            .map_err(ScanError::Overflow)?;
+        }
+        if open.skipped {
+            checked_increment(
+                &mut self.summary.skipped_candidate_count,
+                OverflowError::SkippedCandidateCount,
+            )
+            .map_err(ScanError::Overflow)?;
         }
         Ok(())
     }
 
-    fn should_suppress(&self, index: usize) -> bool {
+    fn is_shadowed(&self, index: usize) -> bool {
         let decoder = &self.decoders[index];
-        if decoder.encoding == Encoding::ASCII || decoder.candidate.open.is_none() {
+        if !is_utf16(decoder.encoding) || decoder.candidate.open.is_none() {
             return false;
         }
         let candidate = CandidateRange::from(&decoder.candidate);
         self.last_ascii
-            .is_some_and(|ascii| ascii_suppresses(ascii, candidate))
+            .is_some_and(|ascii| ascii_shadows(ascii, candidate))
             || self
                 .decoders
                 .iter()
@@ -604,29 +688,35 @@ impl<'a, S: StringSink> Scanner<'a, S> {
                 .any(|(other_index, other)| {
                     other_index != index
                         && other.candidate.open.is_some()
-                        && self.suppresses(other_index, index)
+                        && self.shadows(other_index, index)
                 })
     }
 
-    fn suppresses(&self, winner_index: usize, candidate_index: usize) -> bool {
+    /// Whether the open candidate at `winner_index` shadows the open candidate at
+    /// `candidate_index`. Only UTF-16 readings are ever shadowed, by ASCII or UTF-16 winners.
+    fn shadows(&self, winner_index: usize, candidate_index: usize) -> bool {
         let winner = &self.decoders[winner_index];
         let candidate = &self.decoders[candidate_index];
-        if winner.candidate.open.is_none() || candidate.candidate.open.is_none() {
+        if winner.candidate.open.is_none()
+            || candidate.candidate.open.is_none()
+            || !is_utf16(candidate.encoding)
+        {
             return false;
         }
         let winner_range = CandidateRange::from(&winner.candidate);
         let candidate_range = CandidateRange::from(&candidate.candidate);
-        if winner.encoding == Encoding::ASCII {
-            candidate.encoding != Encoding::ASCII && ascii_suppresses(winner_range, candidate_range)
-        } else {
-            candidate.encoding != Encoding::ASCII
-                && (utf16_suppresses_shifted(winner_range, candidate_range)
+        match winner.encoding {
+            Encoding::ASCII => ascii_shadows(winner_range, candidate_range),
+            Encoding::UTF16LE | Encoding::UTF16BE => {
+                utf16_shadows_shifted(winner_range, candidate_range)
                     || self.prefers_exact_ascii_copy(
                         winner_index,
                         winner_range,
                         candidate_index,
                         candidate_range,
-                    ))
+                    )
+            }
+            Encoding::UTF8 => false,
         }
     }
 
@@ -637,8 +727,9 @@ impl<'a, S: StringSink> Scanner<'a, S> {
         candidate_index: usize,
         candidate_range: CandidateRange,
     ) -> bool {
+        let winner_encoding = self.decoders[winner_index].encoding;
         if !is_exact_opposite_endian_ascii_copy(
-            self.decoders[winner_index].encoding,
+            winner_encoding,
             winner_range,
             self.decoders[candidate_index].encoding,
             candidate_range,
@@ -646,13 +737,18 @@ impl<'a, S: StringSink> Scanner<'a, S> {
             return false;
         }
 
-        // Exact copies are byte-ambiguous. Prefer only a lane established by
-        // the source boundary or an adjacent terminated hit.
+        // Exact copies are byte-ambiguous. Prefer a lane established by the
+        // source boundary or an adjacent terminated hit.
         let winner_evidence = winner_range.start == 0
             || follows_utf16_neighbor(self.last_utf16[winner_index], winner_range);
         let candidate_evidence = candidate_range.start == 0
             || follows_utf16_neighbor(self.last_utf16[candidate_index], candidate_range);
-        winner_evidence && !candidate_evidence
+        if winner_evidence != candidate_evidence {
+            return winner_evidence;
+        }
+        // Without deciding evidence, read UTF-16 as little-endian, as FLOSS and YARA `wide` do.
+        // The big-endian copy is still reported, shadowed.
+        winner_encoding == Encoding::UTF16LE
     }
 
     fn finish_eof(&mut self) -> Result<(), ScanError<S::Error>> {
@@ -704,13 +800,17 @@ fn checked_increment(value: &mut u64, error: OverflowError) -> Result<(), Overfl
     }
 }
 
-fn ascii_suppresses(ascii: CandidateRange, utf16: CandidateRange) -> bool {
+fn is_utf16(encoding: Encoding) -> bool {
+    matches!(encoding, Encoding::UTF16LE | Encoding::UTF16BE)
+}
+
+fn ascii_shadows(ascii: CandidateRange, utf16: CandidateRange) -> bool {
     utf16.ascii_character_count != utf16.character_count
         && ascii.start.abs_diff(utf16.start) <= 1
         && ascii.end.abs_diff(utf16.end) <= 1
 }
 
-fn utf16_suppresses_shifted(winner: CandidateRange, candidate: CandidateRange) -> bool {
+fn utf16_shadows_shifted(winner: CandidateRange, candidate: CandidateRange) -> bool {
     if winner.ascii_character_count != winner.character_count {
         return false;
     }
@@ -753,6 +853,71 @@ fn follows_utf16_neighbor(previous: Option<CandidateRange>, candidate: Candidate
 }
 
 impl Decoder {
+    /// Ends an incomplete UTF-8 sequence that `byte` cannot continue, and reports whether it
+    /// did. The caller then passes `byte` to [`Self::consume_utf8_byte`] as a new sequence.
+    fn interrupt_utf8_sequence(&mut self, byte: u8) -> bool {
+        let DecoderKind::Utf8 { pending } = &mut self.kind else {
+            unreachable!("only the UTF-8 decoder has UTF-8 sequence state")
+        };
+        match pending {
+            Some(sequence) if !(sequence.next.0..=sequence.next.1).contains(&byte) => {
+                *pending = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Decodes well-formed UTF-8 as defined by Unicode Table 3-7 and RFC 3629, which excludes
+    /// overlong forms, surrogate code points, and values above U+10FFFF.
+    fn consume_utf8_byte(&mut self, offset: u64, byte: u8) -> Utf8Step {
+        let DecoderKind::Utf8 { pending } = &mut self.kind else {
+            unreachable!("only the UTF-8 decoder has UTF-8 sequence state")
+        };
+        if let Some(sequence) = pending.as_mut() {
+            debug_assert!((sequence.next.0..=sequence.next.1).contains(&byte));
+            sequence.value = (sequence.value << 6) | u32::from(byte & 0x3f);
+            sequence.remaining -= 1;
+            sequence.next = (0x80, 0xbf);
+            if sequence.remaining > 0 {
+                return Utf8Step::Pending;
+            }
+            let start = sequence.start;
+            let value = sequence.value;
+            *pending = None;
+            return Utf8Step::Scalar {
+                offset: start,
+                width: offset - start + 1,
+                character: char::from_u32(value).expect("Table 3-7 admits only scalar values"),
+            };
+        }
+        let (value, remaining, next) = match byte {
+            0x00..=0x7f => {
+                return Utf8Step::Scalar {
+                    offset,
+                    width: 1,
+                    character: char::from(byte),
+                }
+            }
+            0xc2..=0xdf => (byte & 0x1f, 1, (0x80, 0xbf)),
+            0xe0 => (byte & 0x0f, 2, (0xa0, 0xbf)),
+            0xe1..=0xec | 0xee..=0xef => (byte & 0x0f, 2, (0x80, 0xbf)),
+            0xed => (byte & 0x0f, 2, (0x80, 0x9f)),
+            0xf0 => (byte & 0x07, 3, (0x90, 0xbf)),
+            0xf1..=0xf3 => (byte & 0x07, 3, (0x80, 0xbf)),
+            0xf4 => (byte & 0x07, 3, (0x80, 0x8f)),
+            // C0, C1, and F5..FF never occur; 80..BF cannot start a sequence.
+            _ => return Utf8Step::IllFormed,
+        };
+        *pending = Some(Utf8Sequence {
+            start: offset,
+            value: u32::from(value),
+            remaining,
+            next,
+        });
+        Utf8Step::Pending
+    }
+
     fn consume_utf16_byte(&mut self, offset: u64, byte: u8) -> Option<(u64, u16)> {
         let DecoderKind::Utf16 {
             big_endian,
@@ -761,7 +926,7 @@ impl Decoder {
             ..
         } = &mut self.kind
         else {
-            unreachable!("ASCII decoder has no UTF-16 byte state")
+            unreachable!("only UTF-16 decoders have UTF-16 byte state")
         };
         if offset % 2 == u64::from(*alignment) {
             *first_byte = Some((offset, byte));
@@ -779,14 +944,14 @@ impl Decoder {
 
     fn take_high_surrogate(&mut self) -> Option<(u64, u16)> {
         let DecoderKind::Utf16 { high_surrogate, .. } = &mut self.kind else {
-            unreachable!("ASCII decoder has no UTF-16 surrogate state")
+            unreachable!("only UTF-16 decoders have UTF-16 surrogate state")
         };
         high_surrogate.take()
     }
 
     fn set_high_surrogate(&mut self, offset: u64, unit: u16) {
         let DecoderKind::Utf16 { high_surrogate, .. } = &mut self.kind else {
-            unreachable!("ASCII decoder has no UTF-16 surrogate state")
+            unreachable!("only UTF-16 decoders have UTF-16 surrogate state")
         };
         *high_surrogate = Some((offset, unit));
     }

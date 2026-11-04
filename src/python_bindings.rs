@@ -27,12 +27,15 @@ struct PyStringHit {
     character_count: u64,
     #[pyo3(get)]
     decoded_utf8_length: u64,
+    #[pyo3(get)]
+    shadowed: bool,
 }
 
 impl From<RustStringHit> for PyStringHit {
     fn from(hit: RustStringHit) -> Self {
         let encoding = match hit.start.encoding {
             RustEncoding::ASCII => "ascii",
+            RustEncoding::UTF8 => "utf-8",
             RustEncoding::UTF16LE => "utf-16le",
             RustEncoding::UTF16BE => "utf-16be",
         };
@@ -43,6 +46,7 @@ impl From<RustStringHit> for PyStringHit {
             encoding: encoding.to_owned(),
             character_count: hit.finish.character_count,
             decoded_utf8_length: hit.finish.decoded_utf8_length,
+            shadowed: hit.finish.shadowed,
         }
     }
 }
@@ -57,9 +61,9 @@ impl From<EncodingNotFoundError> for PyErr {
 /// :param file_path: path to file (can't be with bytes option)
 /// :param bytes: bytes (can't be with file_path option)
 /// :param min_length: strings minimum length
-/// :param encoding: strings encoding (default is ["ascii"])
+/// :param encoding: strings encoding (default is ["ascii"]; options are "ascii", "utf-8", "utf-16le", "utf-16be")
 /// :param buffer_size: the buffer size to read the file (relevant only to file_path option)
-/// :return: list of typed string hits with source and decoded metadata
+/// :return: list of typed string hits with source and decoded metadata, shadowed readings included
 /// :raises: raise StringsException if there is any error during string extraction
 ///          raise EncodingNotFoundException if the function got an unsupported encondings
 #[pyfunction()]
@@ -113,12 +117,12 @@ fn strings(
     })
 }
 
-/// Dump strings from binary file or bytes to json file.
+/// Dump strings from binary file or bytes to a json file of [text, offset, shadowed] arrays.
 /// :param output_file: path to file to dump into
 /// :param file_path: path to file (can't be with bytes option)
 /// :param bytes: bytes (can't be with file_path option)
 /// :param min_length: strings minimum length
-/// :param encoding: strings encoding (default is ["ascii"])
+/// :param encoding: strings encoding (default is ["ascii"]; options are "ascii", "utf-8", "utf-16le", "utf-16be")
 /// :param buffer_size: the buffer size to read the file (relevant only to file_path option)
 /// :return: None
 /// :raises: raise StringsException if there is any error during string extraction

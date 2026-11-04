@@ -24,7 +24,7 @@ pip install rust-strings
 
 ```bash
 [dependencies]
-rust-strings = "0.8.0"
+rust-strings = "0.9.0"
 ```
 
 ## Usage
@@ -41,7 +41,7 @@ hits = rust_strings.strings(file_path="/bin/ls", min_length=3)
 # You can also set buffer size when reading from file (default is 1mb)
 rust_strings.strings(file_path="/bin/ls", min_length=5, buffer_size=1024)
 
-# You can set encoding if you need (default is 'ascii', options are 'utf-16le', 'utf-16be')
+# You can set encoding if you need (default is 'ascii', options are 'utf-8', 'utf-16le', 'utf-16be')
 rust_strings.strings(file_path=r"C:\Windows\notepad.exe", min_length=5, encodings=["utf-16le"])
 
 # You can set multiple encoding
@@ -49,12 +49,12 @@ rust_strings.strings(file_path=r"C:\Windows\notepad.exe", min_length=5, encoding
 
 # You can also pass bytes instead of file_path
 rust_strings.strings(bytes=b"test\x00\x00", min_length=4, encodings=["ascii"])
-# The result contains StringHit objects with text, offsets, encoding, and lengths.
+# The result contains StringHit objects with text, offsets, encoding, lengths, and shadowed.
 
 # You can also dump to json file
 rust_strings.dump_strings("strings.json", bytes=b"test\x00\x00", min_length=4, encodings=["ascii"])
-# `strings.json` content:
-# [["test", 0]]
+# `strings.json` content, as [text, offset, shadowed]:
+# [["test", 0, false]]
 ```
 
 ### Rust
@@ -97,41 +97,82 @@ can overlap, so each callback includes a stable `HitId`. A sink can return
 `SkipCurrent` to stop text delivery while the scanner continues to count the
 candidate and scan the input.
 
+### Encodings
+
+- `ASCII` reads printable ASCII bytes and tab.
+- `UTF8` reads well-formed UTF-8 as defined by Unicode Table 3-7 and RFC 3629.
+  Overlong forms, surrogate code points (`ED A0..BF ..`), values above U+10FFFF,
+  the bytes `C0`, `C1`, and `F5..FF`, and continuation bytes without a lead are
+  ill-formed. An ill-formed byte ends the current string and is never decoded.
+  The decoder then resynchronizes as the Unicode maximal-subpart practice does
+  (Unicode §3.9), so a well-formed sequence that starts inside the bad bytes is
+  still found. Parse it from `"utf8"` or `"utf-8"`.
+- `UTF16LE` and `UTF16BE` read UTF-16 at both byte alignments and pair
+  surrogates. An unpaired surrogate ends the string.
+
+Offsets and source lengths are byte offsets into the input for every encoding.
+
 ### String characters
 
 A string holds printable characters and tab. Other control characters end it,
 including line feed and carriage return, as in GNU `strings` without
 `--include-all-whitespace`. The Unicode line and paragraph separators (U+2028,
-U+2029) end a UTF-16 string too. Each line of embedded text is therefore its own
-hit with its own source offset, and no hit contains a character that a line
-splitter breaks on.
+U+2029) end a UTF-8 or UTF-16 string too. Each line of embedded text is
+therefore its own hit with its own source offset, and no hit contains a
+character that a line splitter breaks on.
 
-### Ordering and suppression
+### Ordering
 
 The scanner processes encodings in option order. UTF-16 alignment zero runs
 before alignment one. It assigns hit IDs when candidates reach the minimum.
 
 Chunks follow their start immediately. At a shared boundary, the scanner
-aborts known artifacts before it finishes the preferred hit. At EOF, it closes
-decoders in the same order.
+finishes shadowed readings before it finishes the reading that shadows them.
+At EOF, it closes decoders in the same order.
 
-ASCII wins when a UTF-16 view has the same byte range, within one alignment
-byte, and contains non-ASCII scalars. This removes UTF-16 garbage from normal
-ASCII. It does not suppress null-interleaved or high-byte UTF-16 text.
+### Duplicate handling
 
-An all-ASCII UTF-16 hit wins over its one-byte shifted suffix and non-ASCII
-shifted copy. Other overlapping Unicode hits remain because the bytes do not
-prove which interpretation is intentional.
+The scanner never deletes a reading it decoded. When two decoders read nearly
+the same bytes, the losing reading still finishes, with
+`HitFinish::shadowed` set to `true`:
 
-Exact adjacent ASCII copies in opposite endian modes are byte-ambiguous. The
-scanner prefers a decoder lane only when that lane starts at source offset zero
-or continues two bytes after its previous hit. The two-byte gap is one UTF-16
-NUL terminator. This removes the shifted copy at a neighboring string boundary.
-Without either fact, the scanner retains both views instead of guessing.
+- A shadowed hit lost to an overlapping reading of the same or nearly the same
+  bytes. That winner can itself lose to a third reading, but every such chain
+  ends at an unshadowed hit that the same scan finishes.
+- A shadowed hit ends when its winner ends, so it holds only the characters
+  decoded until then. Its decoder continues with a fresh candidate.
+- `ScanSummary::candidate_count` counts unshadowed hits;
+  `ScanSummary::shadowed_candidate_count` counts shadowed hits.
+- A shadowed hit is not evidence for later decisions about its decoder lane.
+- `strings` returns and `dump_strings` writes shadowed hits too. The command
+  line tool prints them only with `--shadowed`.
 
-If both overlapping views decode to valid non-ASCII Unicode, the scanner keeps
-both in decoder order. Neither view has stronger byte evidence. Retaining both
-avoids falsely deleting a valid string based only on alignment.
+Only UTF-16 readings are shadowed. The rules are:
+
+- ASCII shadows a UTF-16 view with the same byte range, within one alignment
+  byte, that contains non-ASCII scalars. This marks UTF-16 garbage read from
+  normal ASCII. Null-interleaved or high-byte UTF-16 text is not shadowed. When
+  the UTF-16 view is real text whose bytes happen to be printable ASCII, such
+  as some CJK strings, the UTF-16 reading is still reported, shadowed.
+- An all-ASCII UTF-16 hit shadows its one-byte shifted suffix and non-ASCII
+  shifted copy. Other overlapping Unicode hits stay unshadowed because the
+  bytes do not prove which interpretation is intentional.
+- Exact adjacent ASCII copies in opposite endian modes are byte-ambiguous. The
+  scanner prefers a decoder lane that starts at source offset zero or continues
+  two bytes after its previous unshadowed hit; the two-byte gap is one UTF-16
+  NUL terminator. When neither lane or both lanes have that evidence, UTF-16LE
+  wins and the UTF-16BE copy is shadowed, as FLOSS and YARA `wide` read UTF-16
+  as little-endian.
+- If both overlapping views decode to valid non-ASCII Unicode, both stay
+  unshadowed in decoder order.
+
+UTF-8 takes no part in these rules; ASCII and UTF-8 never shadow each other.
+A UTF-8 string with a non-ASCII character is reported beside the ASCII pieces
+of the same bytes. A UTF-8 candidate whose characters are all ASCII is the ASCII
+decoder's hit at the same offset, so when the ASCII decoder runs, the scanner
+aborts it and counts it in `ScanSummary::duplicate_candidate_count`. That
+abort, and the aborts after a reader, sink, or counter failure, are the only
+aborts.
 
 If any sink callback fails, scanning stops without another sink callback.
 

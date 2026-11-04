@@ -27,6 +27,31 @@ def test_bytes():
     assert extracted[0].encoding == "ascii"
     assert extracted[0].character_count == 4
     assert extracted[0].decoded_utf8_length == 4
+    assert extracted[0].shadowed is False
+
+
+def test_shadowed_readings_are_returned_and_marked():
+    # Little-endian pairs from offset 1 are 00 65, 00 73, 00 74: the swapped "est",
+    # shadowed by "test".
+    extracted = rust_strings.strings(
+        bytes=b"t\x00e\x00s\x00t\x00\x00\x00", encodings=["utf-16le"]
+    )
+    assert [(hit.text, hit.source_offset, hit.shadowed) for hit in extracted] == [
+        ("test", 0, False),
+        ("\u6500\u7300\u7400", 1, True),
+    ]
+
+
+def test_utf8():
+    # "Jörg" is 4a c3 b6 72 67; the ASCII decoder stops at c3.
+    extracted = rust_strings.strings(
+        bytes=b"\x00J\xc3\xb6rg\x00", encodings=["ascii", "utf-8"]
+    )
+    assert [(hit.text, hit.source_offset, hit.encoding) for hit in extracted] == [
+        ("Jörg", 1, "utf-8")
+    ]
+    assert extracted[0].source_byte_length == 5
+    assert extracted[0].character_count == 4
 
 
 def test_bytes_min_length_1():
@@ -75,7 +100,10 @@ def test_multiple_encodings():
 
 def test_json_dump(temp_file: Path):
     rust_strings.dump_strings(temp_file, bytes=b'\x00\x00test"\n\tmore\x00\x00')
-    assert json.loads(temp_file.read_text()) == [['test"', 2], ["\tmore", 8]]
+    assert json.loads(temp_file.read_text()) == [
+        ['test"', 2, False],
+        ["\tmore", 8, False],
+    ]
 
 
 def test_json_dump_multiple_strings(temp_file: Path):
@@ -83,7 +111,18 @@ def test_json_dump_multiple_strings(temp_file: Path):
         temp_file, bytes=b'\x00\x00test"\n\tmore\x00\x00more text over here'
     )
     assert json.loads(temp_file.read_text()) == [
-        ['test"', 2],
-        ["\tmore", 8],
-        ["more text over here", 15],
+        ['test"', 2, False],
+        ["\tmore", 8, False],
+        ["more text over here", 15, False],
+    ]
+
+
+def test_json_dump_shadowed(temp_file: Path):
+    # The shadowed view's terminator comes first, so it is written first.
+    rust_strings.dump_strings(
+        temp_file, bytes=b"t\x00e\x00s\x00t\x00\x00\x00", encodings=["utf-16le"]
+    )
+    assert json.loads(temp_file.read_text()) == [
+        ["\u6500\u7300\u7400", 1, True],
+        ["test", 0, False],
     ]
