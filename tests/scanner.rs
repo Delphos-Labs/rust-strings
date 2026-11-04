@@ -683,7 +683,7 @@ fn genuine_odd_aligned_utf16_wins_exact_copy_shadowing() {
         (
             le_bytes,
             Encoding::UTF16LE,
-            [
+            vec![
                 (
                     format!("\u{4fff}{}", swapped("DD_REAL")),
                     0,
@@ -693,17 +693,20 @@ fn genuine_odd_aligned_utf16_wins_exact_copy_shadowing() {
             ],
         ),
         // ff 00 4f 00 44 ... 4c 00 00: pairs from offset 0 read U+00FF or U+FF00 first, and
-        // the little-endian view reaches the terminator's first byte.
+        // the little-endian view reaches the terminator's first byte. Little-endian pairs from
+        // offset 1 (00 4f, 00 44, ...) read the same U+4F00, U+4400, ... as big-endian pairs
+        // from offset 0 (4f 00, 44 00, ...), and the open view from offset 0 shadows them.
         (
             be_bytes,
             Encoding::UTF16BE,
-            [
+            vec![
                 ("\u{ff}ODD_REAL".to_owned(), 0, Encoding::UTF16LE),
                 (
                     format!("\u{ff00}{}", swapped("ODD_REAL")),
                     0,
                     Encoding::UTF16BE,
                 ),
+                (swapped("ODD_REAL"), 1, Encoding::UTF16LE),
             ],
         ),
     ] {
@@ -783,6 +786,89 @@ fn exact_opposite_endian_copy_without_evidence_prefers_little_endian() {
         );
         assert_eq!(summary.shadowed_candidate_count, 2);
     }
+}
+
+fn utf16_options() -> ScanOptions {
+    options(4, &[Encoding::ASCII, Encoding::UTF16LE, Encoding::UTF16BE])
+}
+
+#[test]
+fn big_endian_copy_of_little_endian_cyrillic_is_shadowed() {
+    // "Пароль: %s" in UTF-16LE at 0x28: 1f 04 30 04 40 04 3e 04 3b 04 4c 04 3a 00 20 00 25 00
+    // 73 00 00 00. Big-endian pairs from 0x29 are 04 30, 04 40, 04 3e, 04 3b, 04 4c, 04 3a,
+    // 00 20, 00 25, 00 73: "арольк %s", where 04 3a is U+043A.
+    let mut bytes = vec![0; 0x28];
+    bytes.extend([
+        0x1f, 0x04, 0x30, 0x04, 0x40, 0x04, 0x3e, 0x04, 0x3b, 0x04, 0x4c, 0x04, 0x3a, 0x00, 0x20,
+        0x00, 0x25, 0x00, 0x73, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]);
+    let mut reader = bytes.as_slice();
+    let mut sink = CollectSink::default();
+    scan(&mut reader, &utf16_options(), &mut sink).unwrap();
+
+    assert_unique_winner(&sink, "Пароль: %s", 0x28, Encoding::UTF16LE);
+    assert_shadowed(&sink, "арольк %s", 0x29, Encoding::UTF16BE);
+}
+
+#[test]
+fn big_endian_copy_of_little_endian_greek_is_shadowed() {
+    // "Ελληνικά" in UTF-16LE at 16: 95 03 bb 03 bb 03 b7 03 bd 03 b9 03 ba 03 ac 03 00 00.
+    // Big-endian pairs from 17 read the next seven letters, then 03 00, the combining grave
+    // accent U+0300.
+    let mut bytes = vec![0; 16];
+    bytes.extend([
+        0x95, 0x03, 0xbb, 0x03, 0xbb, 0x03, 0xb7, 0x03, 0xbd, 0x03, 0xb9, 0x03, 0xba, 0x03, 0xac,
+        0x03, 0x00, 0x00, 0x00, 0x00,
+    ]);
+    let mut reader = bytes.as_slice();
+    let mut sink = CollectSink::default();
+    scan(&mut reader, &utf16_options(), &mut sink).unwrap();
+
+    assert_unique_winner(&sink, "Ελληνικά", 16, Encoding::UTF16LE);
+    assert_shadowed(&sink, "λληνικά\u{300}", 17, Encoding::UTF16BE);
+}
+
+#[test]
+fn big_endian_cyrillic_with_evidence_shadows_its_little_endian_copy() {
+    // UTF-16BE "Файл" at 0, one NUL code unit, then UTF-16BE "Пароль" at 10:
+    // 04 24 04 30 04 39 04 3b 00 00 04 1f 04 30 04 40 04 3e 04 3b 04 4c 00 00.
+    let bytes = [
+        0x04, 0x24, 0x04, 0x30, 0x04, 0x39, 0x04, 0x3b, 0x00, 0x00, 0x04, 0x1f, 0x04, 0x30, 0x04,
+        0x40, 0x04, 0x3e, 0x04, 0x3b, 0x04, 0x4c, 0x00, 0x00, 0x00, 0x00,
+    ];
+    let mut reader = &bytes[..];
+    let mut sink = CollectSink::default();
+    scan(&mut reader, &utf16_options(), &mut sink).unwrap();
+
+    // "Файл" starts the input and "Пароль" follows it after one NUL code unit, so the
+    // big-endian lane has evidence both times.
+    assert_unique_winner(&sink, "Файл", 0, Encoding::UTF16BE);
+    assert_unique_winner(&sink, "Пароль", 10, Encoding::UTF16BE);
+    // Little-endian pairs from 1 are 24 04, 30 04, 39 04, 3b 00: "Фай;", ended when "Файл"
+    // wins. The lane continues with 00 04 (U+0400), 1f 04, ..., 4c 00 (U+004C).
+    assert_shadowed(&sink, "Фай;", 1, Encoding::UTF16LE);
+    assert_shadowed(&sink, "\u{400}ПаролL", 9, Encoding::UTF16LE);
+}
+
+#[test]
+fn split_big_endian_copy_of_a_mixed_script_path_is_shadowed() {
+    // "C:\Users\Пользователь" in UTF-16LE at 16, 42 bytes.
+    let mut bytes = vec![0; 16];
+    bytes.extend(b"C\0:\0\\\0U\0s\0e\0r\0s\0\\\0");
+    bytes.extend([
+        0x1f, 0x04, 0x3e, 0x04, 0x3b, 0x04, 0x4c, 0x04, 0x37, 0x04, 0x3e, 0x04, 0x32, 0x04, 0x30,
+        0x04, 0x42, 0x04, 0x35, 0x04, 0x3b, 0x04, 0x4c, 0x04, 0x00, 0x00, 0x00, 0x00,
+    ]);
+    let mut reader = bytes.as_slice();
+    let mut sink = CollectSink::default();
+    scan(&mut reader, &utf16_options(), &mut sink).unwrap();
+
+    assert_unique_winner(&sink, "C:\\Users\\Пользователь", 16, Encoding::UTF16LE);
+    // Big-endian pairs from 15 start with the zero byte before the path: 00 43, 00 3a, ...,
+    // 00 5c read "C:\Users\" until 00 1f, the control U+001F at 33. The lane restarts at 35
+    // with 04 3e, ..., 04 4c, then 04 00 (U+0400) from the last high byte and the terminator.
+    assert_shadowed(&sink, "C:\\Users\\", 15, Encoding::UTF16BE);
+    assert_shadowed(&sink, "ользователь\u{400}", 35, Encoding::UTF16BE);
 }
 
 #[test]

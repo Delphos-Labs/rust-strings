@@ -708,19 +708,22 @@ impl<'a, S: StringSink> Scanner<'a, S> {
         match winner.encoding {
             Encoding::ASCII => ascii_shadows(winner_range, candidate_range),
             Encoding::UTF16LE | Encoding::UTF16BE => {
+                // The all-ASCII rules decide every pair they cover, so the opposite-endian
+                // rule never shadows a reading that an all-ASCII rule would keep.
                 utf16_shadows_shifted(winner_range, candidate_range)
-                    || self.prefers_exact_ascii_copy(
-                        winner_index,
-                        winner_range,
-                        candidate_index,
-                        candidate_range,
-                    )
+                    || (!utf16_shadows_shifted(candidate_range, winner_range)
+                        && self.prefers_opposite_endian_reading(
+                            winner_index,
+                            winner_range,
+                            candidate_index,
+                            candidate_range,
+                        ))
             }
             Encoding::UTF8 => false,
         }
     }
 
-    fn prefers_exact_ascii_copy(
+    fn prefers_opposite_endian_reading(
         &self,
         winner_index: usize,
         winner_range: CandidateRange,
@@ -728,7 +731,7 @@ impl<'a, S: StringSink> Scanner<'a, S> {
         candidate_range: CandidateRange,
     ) -> bool {
         let winner_encoding = self.decoders[winner_index].encoding;
-        if !is_exact_opposite_endian_ascii_copy(
+        if !is_opposite_endian_shift(
             winner_encoding,
             winner_range,
             self.decoders[candidate_index].encoding,
@@ -737,7 +740,7 @@ impl<'a, S: StringSink> Scanner<'a, S> {
             return false;
         }
 
-        // Exact copies are byte-ambiguous. Prefer a lane established by the
+        // Both readings decode the same bytes. Prefer a lane established by the
         // source boundary or an adjacent terminated hit.
         let winner_evidence = winner_range.start == 0
             || follows_utf16_neighbor(self.last_utf16[winner_index], winner_range);
@@ -747,7 +750,7 @@ impl<'a, S: StringSink> Scanner<'a, S> {
             return winner_evidence;
         }
         // Without deciding evidence, read UTF-16 as little-endian, as FLOSS and YARA `wide` do.
-        // The big-endian copy is still reported, shadowed.
+        // The big-endian reading is still reported, shadowed.
         winner_encoding == Encoding::UTF16LE
     }
 
@@ -824,27 +827,40 @@ fn utf16_shadows_shifted(winner: CandidateRange, candidate: CandidateRange) -> b
     shifted_suffix || non_ascii_copy
 }
 
-fn is_exact_opposite_endian_ascii_copy(
-    winner_encoding: Encoding,
-    winner: CandidateRange,
-    candidate_encoding: Encoding,
-    candidate: CandidateRange,
+/// Whether two UTF-16 readings of opposite endianness decode the same bytes one byte apart.
+///
+/// At opposite byte alignments, every code unit of one reading straddles two adjacent code
+/// units of the other: a UTF-16LE unit `lo hi` at `s` is followed by `lo' hi'`, and the
+/// UTF-16BE unit at `s + 1` is `hi lo'`. When the text's characters share one high byte, as
+/// ASCII (U+00xx), Greek (U+03xx), or Cyrillic (U+04xx) text does, that unit is the next
+/// character, so the opposite lane reads nearly the same text. The same holds for a real
+/// UTF-16BE string read by the UTF-16LE lane one byte later.
+///
+/// The readings pair when one lies inside the other's span widened by one byte at each end,
+/// the byte its first or last unit straddles. Two genuine strings cannot share bytes, so the
+/// inner reading re-reads bytes the outer one already decoded. Containment, rather than an
+/// overlap fraction or a one-byte start difference, also pairs the pieces of a copy that a
+/// script change splits: in "\П" read one byte off, the unit `00 1F` is the control U+001F,
+/// so the big-endian copy of `C:\Users\Пользователь` breaks into `C:\Users\` and
+/// `ользователь` plus one straddled character, and each piece lies inside the original.
+fn is_opposite_endian_shift(
+    first_encoding: Encoding,
+    first: CandidateRange,
+    second_encoding: Encoding,
+    second: CandidateRange,
 ) -> bool {
-    let adjacent_opposite_endian = match (winner_encoding, candidate_encoding) {
-        (Encoding::UTF16LE, Encoding::UTF16BE) => {
-            candidate.start.checked_add(1) == Some(winner.start)
-                && candidate.end.checked_add(1) == Some(winner.end)
-        }
-        (Encoding::UTF16BE, Encoding::UTF16LE) => {
-            winner.start.checked_add(1) == Some(candidate.start)
-                && winner.end.checked_add(1) == Some(candidate.end)
-        }
-        _ => false,
-    };
-    adjacent_opposite_endian
-        && winner.ascii_character_count == winner.character_count
-        && candidate.ascii_character_count == candidate.character_count
-        && winner.character_count == candidate.character_count
+    let opposite_endian = matches!(
+        (first_encoding, second_encoding),
+        (Encoding::UTF16LE, Encoding::UTF16BE) | (Encoding::UTF16BE, Encoding::UTF16LE)
+    );
+    let opposite_alignment = (first.start ^ second.start) & 1 == 1;
+    opposite_endian
+        && opposite_alignment
+        && (lies_within_one_byte(first, second) || lies_within_one_byte(second, first))
+}
+
+fn lies_within_one_byte(inner: CandidateRange, outer: CandidateRange) -> bool {
+    inner.start.saturating_add(1) >= outer.start && inner.end <= outer.end.saturating_add(1)
 }
 
 fn follows_utf16_neighbor(previous: Option<CandidateRange>, candidate: CandidateRange) -> bool {

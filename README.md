@@ -155,16 +155,24 @@ Only UTF-16 readings are shadowed. The rules are:
   the UTF-16 view is real text whose bytes happen to be printable ASCII, such
   as some CJK strings, the UTF-16 reading is still reported, shadowed.
 - An all-ASCII UTF-16 hit shadows its one-byte shifted suffix and non-ASCII
-  shifted copy. Other overlapping Unicode hits stay unshadowed because the
-  bytes do not prove which interpretation is intentional.
-- Exact adjacent ASCII copies in opposite endian modes are byte-ambiguous. The
-  scanner prefers a decoder lane that starts at source offset zero or continues
-  two bytes after its previous unshadowed hit; the two-byte gap is one UTF-16
-  NUL terminator. When neither lane or both lanes have that evidence, UTF-16LE
-  wins and the UTF-16BE copy is shadowed, as FLOSS and YARA `wide` read UTF-16
-  as little-endian.
-- If both overlapping views decode to valid non-ASCII Unicode, both stay
-  unshadowed in decoder order.
+  shifted copy. Where this rule applies, it decides the pair.
+- UTF-16LE and UTF-16BE readings at opposite byte alignments pair bytes one
+  byte apart, so each re-reads the other. Text whose characters share one high
+  byte, such as ASCII, Greek (U+03xx), or Cyrillic (U+04xx), reads as nearly
+  the same text in both: UTF-16LE `Пароль: %s` at 0x28 reads as UTF-16BE
+  `арольк %s` at 0x29. Two such readings pair when one lies inside the other's
+  span widened by one byte at each end. Containment also pairs each piece of a
+  copy that a script change splits; the copy of `C:\Users\Пользователь` breaks
+  at the control U+001F into `C:\Users\` and `ользователь` plus one character.
+  The scanner prefers a decoder lane that starts at source offset zero or
+  continues two bytes after its previous unshadowed hit; the two-byte gap is
+  one UTF-16 NUL terminator. When neither lane or both lanes have that
+  evidence, UTF-16LE wins and the UTF-16BE reading is shadowed, as FLOSS and
+  YARA `wide` read UTF-16 as little-endian. This rule covers exact adjacent
+  ASCII copies too.
+- Other overlapping readings, such as a same-endian reading of non-ASCII text
+  at the other alignment, stay unshadowed because the bytes do not prove which
+  interpretation is intentional.
 
 UTF-8 takes no part in these rules; ASCII and UTF-8 never shadow each other.
 A UTF-8 string with a non-ASCII character is reported beside the ASCII pieces
