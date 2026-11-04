@@ -107,6 +107,7 @@ fn append_utf16(bytes: &mut Vec<u8>, text: &str, big_endian: bool, terminate: bo
     }
 }
 
+#[track_caller]
 fn matching_record<'a>(sink: &'a CollectSink, text: &str, offset: u64) -> &'a Record {
     sink.records
         .iter()
@@ -161,7 +162,11 @@ fn line_breaks_end_candidates_and_tabs_stay_inside() {
     assert_eq!(sink.records.len(), 3, "{:?}", sink.records);
 
     for (encoding, big_endian) in [(Encoding::UTF16LE, false), (Encoding::UTF16BE, true)] {
-        let bytes = utf16("line one\r\nline two\u{2028}line six", big_endian, 0);
+        let bytes = utf16(
+            "line one\r\nline two\u{2028}line\tsix\u{2029}line ten",
+            big_endian,
+            0,
+        );
         let mut reader = bytes.as_slice();
         let mut sink = CollectSink::default();
         scan(&mut reader, &options(4, &[encoding]), &mut sink).unwrap();
@@ -170,19 +175,25 @@ fn line_breaks_end_candidates_and_tabs_stay_inside() {
             matching_record(&sink, "line one", 0).start.encoding,
             encoding
         );
-        // "line one" and "\r\n" are ten UTF-16 code units; "line two" and U+2028 nine more.
+        // Offsets are bytes, two per UTF-16 code unit. "line one" and "\r\n" are ten units.
         assert_eq!(
             matching_record(&sink, "line two", 20).start.encoding,
             encoding
         );
+        // "line two" and U+2028 are nine more; a tab stays inside "line\tsix".
         assert_eq!(
-            matching_record(&sink, "line six", 38).start.encoding,
+            matching_record(&sink, "line\tsix", 38).start.encoding,
+            encoding
+        );
+        // "line\tsix" and U+2029 are nine more.
+        assert_eq!(
+            matching_record(&sink, "line ten", 56).start.encoding,
             encoding
         );
         assert!(
             sink.records
                 .iter()
-                .all(|record| !record.text.contains(['\n', '\r', '\u{2028}'])),
+                .all(|record| !record.text.contains(['\n', '\r', '\u{2028}', '\u{2029}'])),
             "{:?}",
             sink.records
         );
