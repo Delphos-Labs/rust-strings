@@ -233,8 +233,6 @@ struct Candidate {
     end: u64,
     character_count: u64,
     ascii_character_count: u64,
-    /// Whether the previous code unit in this UTF-16 lane was NUL when the candidate started.
-    follows_nul: bool,
     decoded_utf8_length: u64,
     prefix: String,
     open: Option<OpenHit>,
@@ -247,7 +245,6 @@ impl Candidate {
             end: 0,
             character_count: 0,
             ascii_character_count: 0,
-            follows_nul: false,
             decoded_utf8_length: 0,
             prefix: String::new(),
             open: None,
@@ -259,7 +256,6 @@ impl Candidate {
         self.end = 0;
         self.character_count = 0;
         self.ascii_character_count = 0;
-        self.follows_nul = false;
         self.decoded_utf8_length = 0;
         self.prefix.clear();
         self.open = None;
@@ -283,7 +279,6 @@ enum DecoderKind {
         alignment: u8,
         first_byte: Option<(u64, u8)>,
         high_surrogate: Option<(u64, u16)>,
-        previous_unit_nul: bool,
     },
 }
 
@@ -337,7 +332,6 @@ struct CandidateRange {
     end: u64,
     character_count: u64,
     ascii_character_count: u64,
-    follows_nul: bool,
 }
 
 /// Streams decoded string candidates from a caller-owned reader to a sink.
@@ -409,7 +403,6 @@ impl<'a, S: StringSink> Scanner<'a, S> {
                                 alignment,
                                 first_byte: None,
                                 high_surrogate: None,
-                                previous_unit_nul: false,
                             },
                             candidate: Candidate::new(),
                         });
@@ -478,11 +471,7 @@ impl<'a, S: StringSink> Scanner<'a, S> {
         unit_offset: u64,
         unit: u16,
     ) -> Result<(), ScanError<S::Error>> {
-        let follows_nul = self.decoders[index].replace_previous_unit_nul(unit == 0);
         let pending_high = self.decoders[index].take_high_surrogate();
-        if pending_high.is_none() && self.decoders[index].candidate.character_count == 0 {
-            self.decoders[index].candidate.follows_nul = follows_nul;
-        }
         if let Some((high_offset, high)) = pending_high {
             if (0xDC00..=0xDFFF).contains(&unit) {
                 let value =
@@ -731,17 +720,14 @@ impl<'a, S: StringSink> Scanner<'a, S> {
         }
 
         // Both readings decode the same bytes. Prefer the lane that the source start or an
-        // adjacent hit establishes, then the lane whose previous code unit is a NUL
-        // terminator, then little-endian, the common case.
+        // adjacent hit establishes, then little-endian, the common case: real big-endian text
+        // with neither loses to its little-endian copy.
         let winner_evidence = winner_range.start == 0
             || follows_utf16_neighbor(self.last_utf16[winner_index], winner_range);
         let candidate_evidence = candidate_range.start == 0
             || follows_utf16_neighbor(self.last_utf16[candidate_index], candidate_range);
         if winner_evidence != candidate_evidence {
             return winner_evidence;
-        }
-        if winner_range.follows_nul != candidate_range.follows_nul {
-            return winner_range.follows_nul;
         }
         winner_encoding == Encoding::UTF16LE
     }
@@ -781,7 +767,6 @@ impl From<&Candidate> for CandidateRange {
             end: candidate.end,
             character_count: candidate.character_count,
             ascii_character_count: candidate.ascii_character_count,
-            follows_nul: candidate.follows_nul,
         }
     }
 }
@@ -953,17 +938,6 @@ impl Decoder {
             unreachable!("only UTF-16 decoders have UTF-16 surrogate state")
         };
         *high_surrogate = Some((offset, unit));
-    }
-
-    /// Records whether the current code unit is NUL and returns whether the previous one was.
-    fn replace_previous_unit_nul(&mut self, is_nul: bool) -> bool {
-        let DecoderKind::Utf16 {
-            previous_unit_nul, ..
-        } = &mut self.kind
-        else {
-            unreachable!("only UTF-16 decoders have UTF-16 code unit state")
-        };
-        std::mem::replace(previous_unit_nul, is_nul)
     }
 }
 

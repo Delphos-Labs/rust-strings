@@ -765,8 +765,7 @@ fn eof_candidate_prefers_exact_encoding_without_hiding_its_neighbor() {
 #[test]
 fn exact_opposite_endian_copy_without_evidence_prefers_little_endian() {
     // 00 00 | 00 52 00 69 00 63 00 68 | 00 00 00: big-endian "Rich" at 2 and little-endian
-    // "Rich" at 3. Both follow a NUL code unit, and neither starts the input or follows a hit
-    // of its lane.
+    // "Rich" at 3. Neither starts the input or follows a hit of its lane.
     let bytes = b"\0\0\0R\0i\0c\0h\0\0\0";
     for encodings in [
         [Encoding::ASCII, Encoding::UTF16LE, Encoding::UTF16BE],
@@ -829,27 +828,6 @@ fn big_endian_cyrillic_with_evidence_shadows_its_little_endian_copy() {
     // wins. The lane continues with 00 04 (U+0400), 1f 04, ..., 4c 00 (U+004C).
     assert_shadowed(&sink, "Фай;", 1, Encoding::UTF16LE);
     assert_shadowed(&sink, "\u{400}ПаролL", 9, Encoding::UTF16LE);
-}
-
-#[test]
-fn big_endian_cyrillic_after_a_nul_unit_shadows_its_little_endian_copy() {
-    // A NUL code unit, UTF-16BE "Файл" at 2, a NUL code unit, then UTF-16BE "Пароль" at 12.
-    let mut bytes = vec![0; 2];
-    bytes.extend([
-        0x04, 0x24, 0x04, 0x30, 0x04, 0x39, 0x04, 0x3b, 0x00, 0x00, 0x04, 0x1f, 0x04, 0x30, 0x04,
-        0x40, 0x04, 0x3e, 0x04, 0x3b, 0x04, 0x4c, 0x00, 0x00, 0x00, 0x00,
-    ]);
-    let mut reader = bytes.as_slice();
-    let mut sink = CollectSink::default();
-    scan(&mut reader, &utf16_options(), &mut sink).unwrap();
-
-    // Big-endian "Файл" follows the NUL unit at 0. Little-endian pairs from 1 begin with
-    // 00 04 (U+0400) and follow no NUL unit, so the big-endian lane wins, and "Пароль" then
-    // follows its hit.
-    assert_unique_winner(&sink, "Файл", 2, Encoding::UTF16BE);
-    assert_unique_winner(&sink, "Пароль", 12, Encoding::UTF16BE);
-    assert_shadowed(&sink, "\u{400}Фай;", 1, Encoding::UTF16LE);
-    assert_shadowed(&sink, "\u{400}ПаролL", 11, Encoding::UTF16LE);
 }
 
 #[test]

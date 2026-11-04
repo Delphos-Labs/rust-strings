@@ -156,8 +156,8 @@ Only UTF-16 readings are shadowed. The rules are:
   lies inside the other's span widened by one byte at each end, which also
   pairs each piece of a copy that a control character splits. The scanner
   prefers the lane that starts at source offset zero or continues one NUL code
-  unit after its previous unshadowed hit, then the lane whose previous code
-  unit is NUL, then UTF-16LE, the common case.
+  unit after its previous unshadowed hit, then UTF-16LE, the common case. Real
+  UTF-16BE text with neither loses to its UTF-16LE copy.
 - Other overlapping readings, such as a same-endian reading of non-ASCII text
   at the other alignment, stay unshadowed because the bytes do not prove which
   interpretation is intentional.
