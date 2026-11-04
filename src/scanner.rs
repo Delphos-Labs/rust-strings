@@ -1,8 +1,9 @@
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Read};
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroU8};
 
+use crate::xor::{PaddedXor, XorHit};
 use crate::Encoding;
 
 const READ_BUFFER_SIZE: usize = 8 * 1024;
@@ -47,6 +48,9 @@ pub struct HitStart {
     pub offset: SourceOffset,
     /// The decoder that produced the candidate.
     pub encoding: Encoding,
+    /// The one-byte key that decodes an [`Encoding::XorASCII`] hit; `None`
+    /// for every other encoding.
+    pub xor_key: Option<NonZeroU8>,
 }
 
 /// Metadata available when a hit becomes valid.
@@ -288,6 +292,7 @@ struct Scanner<'a, S> {
     sink: &'a mut S,
     min_length: u64,
     decoders: Vec<Decoder>,
+    padded_xor: Option<PaddedXor>,
     next_hit_id: u64,
     summary: ScanSummary,
     last_ascii: Option<CandidateRange>,
@@ -350,6 +355,7 @@ where
 impl<'a, S: StringSink> Scanner<'a, S> {
     fn new(options: &ScanOptions, sink: &'a mut S) -> Self {
         let mut decoders = Vec::new();
+        let mut padded_xor = None;
         for encoding in &options.encodings {
             match encoding {
                 Encoding::ASCII => decoders.push(Decoder {
@@ -371,6 +377,7 @@ impl<'a, S: StringSink> Scanner<'a, S> {
                         });
                     }
                 }
+                Encoding::XorASCII => padded_xor = Some(PaddedXor::new()),
             }
         }
         let last_utf16 = vec![None; decoders.len()];
@@ -378,6 +385,7 @@ impl<'a, S: StringSink> Scanner<'a, S> {
             sink,
             min_length: options.min_length(),
             decoders,
+            padded_xor,
             next_hit_id: 0,
             summary: ScanSummary::default(),
             last_ascii: None,
@@ -403,6 +411,51 @@ impl<'a, S: StringSink> Scanner<'a, S> {
                     }
                 }
             }
+        }
+        let xor_hit = match &mut self.padded_xor {
+            Some(padded_xor) => padded_xor.consume(offset, byte, self.min_length),
+            None => None,
+        };
+        match xor_hit {
+            Some(hit) => self.report_xor_hit(hit),
+            None => Ok(()),
+        }
+    }
+
+    /// Reports a decoded XOR string as one complete hit. The text is known in
+    /// full when the padding confirms the key, so the hit is never provisional.
+    fn report_xor_hit(&mut self, hit: XorHit) -> Result<(), ScanError<S::Error>> {
+        let id = next_hit_id(&mut self.next_hit_id).map_err(ScanError::Overflow)?;
+        let start = HitStart {
+            offset: SourceOffset(hit.start),
+            encoding: Encoding::XorASCII,
+            xor_key: Some(hit.key),
+        };
+        let skipped = self.sink.start(id, start).map_err(ScanError::Sink)?
+            == SinkControl::SkipCurrent
+            || self.sink.chunk(id, &hit.text).map_err(ScanError::Sink)? == SinkControl::SkipCurrent;
+        let length = hit.text.len() as u64;
+        self.sink
+            .finish(
+                id,
+                HitFinish {
+                    source_length: SourceLength(length),
+                    character_count: length,
+                    decoded_utf8_length: length,
+                },
+            )
+            .map_err(ScanError::Sink)?;
+        checked_increment(
+            &mut self.summary.candidate_count,
+            OverflowError::CandidateCount,
+        )
+        .map_err(ScanError::Overflow)?;
+        if skipped {
+            checked_increment(
+                &mut self.summary.skipped_candidate_count,
+                OverflowError::SkippedCandidateCount,
+            )
+            .map_err(ScanError::Overflow)?;
         }
         Ok(())
     }
@@ -494,14 +547,11 @@ impl<'a, S: StringSink> Scanner<'a, S> {
             return Ok(());
         }
 
-        let id = HitId(self.next_hit_id);
-        self.next_hit_id = self
-            .next_hit_id
-            .checked_add(1)
-            .ok_or(ScanError::Overflow(OverflowError::HitId))?;
+        let id = next_hit_id(&mut self.next_hit_id).map_err(ScanError::Overflow)?;
         let start = HitStart {
             offset: SourceOffset(candidate.start),
             encoding,
+            xor_key: None,
         };
         let skipped =
             self.sink.start(id, start).map_err(ScanError::Sink)? == SinkControl::SkipCurrent;
@@ -694,6 +744,12 @@ impl From<&Candidate> for CandidateRange {
     }
 }
 
+fn next_hit_id(counter: &mut u64) -> Result<HitId, OverflowError> {
+    let id = HitId(*counter);
+    checked_increment(counter, OverflowError::HitId)?;
+    Ok(id)
+}
+
 fn checked_increment(value: &mut u64, error: OverflowError) -> Result<(), OverflowError> {
     match value.checked_add(1) {
         Some(next) => {
@@ -796,7 +852,7 @@ fn is_string_character(character: char) -> bool {
     !character.is_control() || matches!(character, '\t' | '\n' | '\r')
 }
 
-fn is_ascii_string_byte(byte: u8) -> bool {
+pub(crate) fn is_ascii_string_byte(byte: u8) -> bool {
     (b' '..=b'~').contains(&byte) || matches!(byte, b'\t' | b'\n' | b'\r')
 }
 

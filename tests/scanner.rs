@@ -678,7 +678,16 @@ fn short_reads_match_the_complete_one_shot_event_stream() {
     let mut bytes = b"ASCII evidence\0".to_vec();
     bytes.extend(utf16("odd é😀", false, 1));
     bytes.extend([0xd8, 0x00, b'O', 0, b'K', 0, 0, 0]);
-    let scan_options = options(2, &[Encoding::ASCII, Encoding::UTF16LE, Encoding::UTF16BE]);
+    bytes.extend(xor_slot("hidden path", 0x5c, 0x20));
+    let scan_options = options(
+        2,
+        &[
+            Encoding::ASCII,
+            Encoding::UTF16LE,
+            Encoding::UTF16BE,
+            Encoding::XorASCII,
+        ],
+    );
     let expected = event_stream(bytes.as_slice(), &scan_options);
 
     let actual = event_stream(
@@ -736,4 +745,67 @@ fn deterministic_property_chunking_preserves_all_events() {
         );
         assert_eq!(actual, expected, "seed {seed}");
     }
+}
+
+/// Encodes `text` as a zero-padded slot of `size` bytes XORed with `key`.
+fn xor_slot(text: &str, key: u8, size: usize) -> Vec<u8> {
+    let mut slot = text.as_bytes().to_vec();
+    slot.resize(size, 0);
+    slot.iter().map(|byte| byte ^ key).collect()
+}
+
+fn xor_records(bytes: &[u8]) -> Vec<(u64, u8, String)> {
+    let mut reader = bytes;
+    let mut sink = CollectSink::default();
+    scan(&mut reader, &options(4, &[Encoding::XorASCII]), &mut sink).unwrap();
+    sink.records
+        .into_iter()
+        .map(|record| {
+            assert_eq!(record.start.encoding, Encoding::XorASCII);
+            assert_eq!(record.finish.source_length.get(), record.text.len() as u64);
+            let key = record.start.xor_key.expect("XOR hit carries its key").get();
+            (record.start.offset.get(), key, record.text)
+        })
+        .collect()
+}
+
+#[test]
+fn xor_slots_decode_with_the_key_their_padding_repeats() {
+    // 0x57 ^ 0x23 is 't', so the first slot's padding decodes as printable
+    // text under the second key; the second string must not absorb it.
+    let mut bytes = xor_slot("Login Data", 0x57, 0x40);
+    bytes.extend(xor_slot("POST", 0x23, 0x40));
+
+    assert_eq!(
+        xor_records(&bytes),
+        vec![
+            (0x00, 0x57, "Login Data".to_owned()),
+            (0x40, 0x23, "POST".to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn xor_needs_eight_padding_bytes() {
+    let mut short = b"Login Data".map(|byte| byte ^ 0x57).to_vec();
+    short.extend([0x57; 7]);
+    short.push(0xa5);
+    assert_eq!(xor_records(&short), vec![]);
+
+    let mut long = b"Login Data".map(|byte| byte ^ 0x57).to_vec();
+    long.extend([0x57; 8]);
+    assert_eq!(xor_records(&long), vec![(0, 0x57, "Login Data".to_owned())]);
+}
+
+#[test]
+fn xor_rejects_zero_runs_and_code_padding() {
+    // Plain text before zeros is already a literal string, not an XOR hit.
+    let mut bytes = b"plain text".to_vec();
+    bytes.extend([0; 16]);
+    // `ret`, then `jmp rel32` and int3 padding: decodes to "%W,33" under 0xCC,
+    // printable but not a word.
+    bytes.extend([0xc3, 0xe9, 0x9b, 0xe0, 0xff, 0xff]);
+    bytes.extend([0xcc; 16]);
+
+    assert_eq!(xor_records(&bytes), vec![]);
 }
