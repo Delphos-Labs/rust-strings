@@ -24,7 +24,7 @@ pip install rust-strings
 
 ```bash
 [dependencies]
-rust-strings = "0.9.0"
+rust-strings = "0.8.0"
 ```
 
 ## Usage
@@ -49,12 +49,12 @@ rust_strings.strings(file_path=r"C:\Windows\notepad.exe", min_length=5, encoding
 
 # You can also pass bytes instead of file_path
 rust_strings.strings(bytes=b"test\x00\x00", min_length=4, encodings=["ascii"])
-# The result contains StringHit objects with text, offsets, encoding, lengths, and shadowed.
+# The result contains StringHit objects with text, offsets, encoding, and lengths.
 
 # You can also dump to json file
 rust_strings.dump_strings("strings.json", bytes=b"test\x00\x00", min_length=4, encodings=["ascii"])
-# `strings.json` content, as [text, offset, shadowed]:
-# [["test", 0, false]]
+# `strings.json` content:
+# [["test", 0]]
 ```
 
 ### Rust
@@ -117,9 +117,8 @@ Offsets and source lengths are byte offsets into the input for every encoding.
 A string holds printable characters and tab. Other control characters end it,
 including line feed and carriage return, as in GNU `strings` without
 `--include-all-whitespace`. The Unicode line and paragraph separators (U+2028,
-U+2029) end a UTF-8 or UTF-16 string too. Each line of embedded text is
-therefore its own hit with its own source offset, and no hit contains a
-character that a line splitter breaks on.
+U+2029) end a UTF-8 or UTF-16 string too, so each line of embedded text is its
+own hit.
 
 ### Ordering
 
@@ -130,57 +129,44 @@ Chunks follow their start immediately. At a shared boundary, the scanner
 finishes shadowed readings before it finishes the reading that shadows them.
 At EOF, it closes decoders in the same order.
 
-### Duplicate handling
+### Shadowed readings
 
-The scanner never deletes a reading it decoded. When two decoders read nearly
-the same bytes, the losing reading still finishes, with
-`HitFinish::shadowed` set to `true`:
-
-- A shadowed hit lost to an overlapping reading of the same or nearly the same
-  bytes. That winner can itself lose to a third reading, but every such chain
-  ends at an unshadowed hit that the same scan finishes.
-- A shadowed hit ends when its winner ends, so it holds only the characters
-  decoded until then. Its decoder continues with a fresh candidate.
-- `ScanSummary::candidate_count` counts unshadowed hits;
-  `ScanSummary::shadowed_candidate_count` counts shadowed hits.
-- A shadowed hit is not evidence for later decisions about its decoder lane.
-- `strings` returns and `dump_strings` writes shadowed hits too. The command
-  line tool prints them only with `--shadowed`.
+When two decoders read nearly the same bytes, the losing reading still
+finishes, with `HitFinish::shadowed` set to `true`. A shadowed hit ends when
+its winner ends, so it holds only the characters decoded until then, and its
+decoder continues with a fresh candidate. A shadowed hit is not evidence for
+later decisions about its decoder lane, and `ScanSummary::candidate_count`
+does not count it. `strings`, `dump_strings`, the Python bindings, and the
+command line tool drop shadowed hits; a `StringSink` passed to `scan` receives
+them.
 
 Only UTF-16 readings are shadowed. The rules are:
 
 - ASCII shadows a UTF-16 view with the same byte range, within one alignment
   byte, that contains non-ASCII scalars. This marks UTF-16 garbage read from
-  normal ASCII. Null-interleaved or high-byte UTF-16 text is not shadowed. When
-  the UTF-16 view is real text whose bytes happen to be printable ASCII, such
-  as some CJK strings, the UTF-16 reading is still reported, shadowed.
+  normal ASCII. Null-interleaved or high-byte UTF-16 text is not shadowed. Real
+  UTF-16 text whose bytes are all printable ASCII, such as some CJK strings, is
+  shadowed too.
 - An all-ASCII UTF-16 hit shadows its one-byte shifted suffix and non-ASCII
   shifted copy. Where this rule applies, it decides the pair.
-- UTF-16LE and UTF-16BE readings at opposite byte alignments pair bytes one
-  byte apart, so each re-reads the other. Text whose characters share one high
-  byte, such as ASCII, Greek (U+03xx), or Cyrillic (U+04xx), reads as nearly
-  the same text in both: UTF-16LE `Пароль: %s` at 0x28 reads as UTF-16BE
-  `арольк %s` at 0x29. Two such readings pair when one lies inside the other's
-  span widened by one byte at each end. Containment also pairs each piece of a
-  copy that a script change splits; the copy of `C:\Users\Пользователь` breaks
-  at the control U+001F into `C:\Users\` and `ользователь` plus one character.
-  The scanner prefers a decoder lane that starts at source offset zero or
-  continues two bytes after its previous unshadowed hit; the two-byte gap is
-  one UTF-16 NUL terminator. When neither lane or both lanes have that
-  evidence, UTF-16LE wins and the UTF-16BE reading is shadowed, as FLOSS and
-  YARA `wide` read UTF-16 as little-endian. This rule covers exact adjacent
-  ASCII copies too.
+- UTF-16LE and UTF-16BE readings at opposite byte alignments re-read the same
+  bytes. Text whose characters share one high byte, such as ASCII, Greek, or
+  Cyrillic, reads as nearly the same text in both: UTF-16LE `Пароль: %s` at
+  0x28 reads as UTF-16BE `арольк %s` at 0x29. Two such readings pair when one
+  lies inside the other's span widened by one byte at each end, which also
+  pairs each piece of a copy that a control character splits. The scanner
+  prefers the lane that starts at source offset zero or continues one NUL code
+  unit after its previous unshadowed hit, then the lane whose previous code
+  unit is NUL, then UTF-16LE, the common case.
 - Other overlapping readings, such as a same-endian reading of non-ASCII text
   at the other alignment, stay unshadowed because the bytes do not prove which
   interpretation is intentional.
 
-UTF-8 takes no part in these rules; ASCII and UTF-8 never shadow each other.
-A UTF-8 string with a non-ASCII character is reported beside the ASCII pieces
-of the same bytes. A UTF-8 candidate whose characters are all ASCII is the ASCII
-decoder's hit at the same offset, so when the ASCII decoder runs, the scanner
-aborts it and counts it in `ScanSummary::duplicate_candidate_count`. That
-abort, and the aborts after a reader, sink, or counter failure, are the only
-aborts.
+UTF-8 takes no part in these rules. A UTF-8 string with a non-ASCII character
+is reported beside the ASCII pieces of the same bytes. A UTF-8 candidate whose
+characters are all ASCII is the ASCII decoder's hit at the same offset, so when
+the ASCII decoder runs, the scanner aborts it. That abort and the aborts after
+a reader or counter failure are the only aborts.
 
 If any sink callback fails, scanning stops without another sink callback.
 

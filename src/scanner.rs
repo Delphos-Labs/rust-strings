@@ -58,12 +58,8 @@ pub struct HitFinish {
     pub character_count: u64,
     /// The complete decoded text length in UTF-8 bytes.
     pub decoded_utf8_length: u64,
-    /// Whether another reading of the same or nearly the same source bytes won.
-    ///
-    /// The winner can itself be shadowed by a third reading, but every such chain ends at an
-    /// unshadowed hit finished in the same scan. A shadowed hit ends when its winner ends, so it
-    /// holds only the characters decoded until then, and its decoder continues with a fresh
-    /// candidate.
+    /// Whether another reading of the same source bytes won. A shadowed hit ends when its
+    /// winner ends; the README lists the rules.
     pub shadowed: bool,
 }
 
@@ -210,8 +206,6 @@ pub enum OverflowError {
     DecodedUtf8Length,
     CandidateCount,
     SkippedCandidateCount,
-    ShadowedCandidateCount,
-    DuplicateCandidateCount,
 }
 
 impl fmt::Display for OverflowError {
@@ -231,11 +225,6 @@ pub struct ScanSummary {
     pub candidate_count: u64,
     /// The completed candidates, shadowed or not, for which the sink skipped text.
     pub skipped_candidate_count: u64,
-    /// The candidates completed through `StringSink::finish` with `HitFinish::shadowed` set.
-    pub shadowed_candidate_count: u64,
-    /// The all-ASCII UTF-8 candidates discarded through `StringSink::abort` because the ASCII
-    /// decoder reports the same text at the same offset.
-    pub duplicate_candidate_count: u64,
 }
 
 #[derive(Debug)]
@@ -244,6 +233,8 @@ struct Candidate {
     end: u64,
     character_count: u64,
     ascii_character_count: u64,
+    /// Whether the previous code unit in this UTF-16 lane was NUL when the candidate started.
+    follows_nul: bool,
     decoded_utf8_length: u64,
     prefix: String,
     open: Option<OpenHit>,
@@ -256,6 +247,7 @@ impl Candidate {
             end: 0,
             character_count: 0,
             ascii_character_count: 0,
+            follows_nul: false,
             decoded_utf8_length: 0,
             prefix: String::new(),
             open: None,
@@ -267,6 +259,7 @@ impl Candidate {
         self.end = 0;
         self.character_count = 0;
         self.ascii_character_count = 0;
+        self.follows_nul = false;
         self.decoded_utf8_length = 0;
         self.prefix.clear();
         self.open = None;
@@ -290,6 +283,7 @@ enum DecoderKind {
         alignment: u8,
         first_byte: Option<(u64, u8)>,
         high_surrogate: Option<(u64, u16)>,
+        previous_unit_nul: bool,
     },
 }
 
@@ -343,6 +337,7 @@ struct CandidateRange {
     end: u64,
     character_count: u64,
     ascii_character_count: u64,
+    follows_nul: bool,
 }
 
 /// Streams decoded string candidates from a caller-owned reader to a sink.
@@ -414,6 +409,7 @@ impl<'a, S: StringSink> Scanner<'a, S> {
                                 alignment,
                                 first_byte: None,
                                 high_surrogate: None,
+                                previous_unit_nul: false,
                             },
                             candidate: Candidate::new(),
                         });
@@ -482,7 +478,11 @@ impl<'a, S: StringSink> Scanner<'a, S> {
         unit_offset: u64,
         unit: u16,
     ) -> Result<(), ScanError<S::Error>> {
+        let follows_nul = self.decoders[index].replace_previous_unit_nul(unit == 0);
         let pending_high = self.decoders[index].take_high_surrogate();
+        if pending_high.is_none() && self.decoders[index].candidate.character_count == 0 {
+            self.decoders[index].candidate.follows_nul = follows_nul;
+        }
         if let Some((high_offset, high)) = pending_high {
             if (0xDC00..=0xDFFF).contains(&unit) {
                 let value =
@@ -620,11 +620,7 @@ impl<'a, S: StringSink> Scanner<'a, S> {
             // reports this text at this offset.
             self.sink.abort(open.id).map_err(ScanError::Sink)?;
             self.decoders[index].candidate.reset();
-            return checked_increment(
-                &mut self.summary.duplicate_candidate_count,
-                OverflowError::DuplicateCandidateCount,
-            )
-            .map_err(ScanError::Overflow);
+            return Ok(());
         }
 
         let source_length = candidate
@@ -644,13 +640,7 @@ impl<'a, S: StringSink> Scanner<'a, S> {
             )
             .map_err(ScanError::Sink)?;
         self.decoders[index].candidate.reset();
-        if shadowed {
-            checked_increment(
-                &mut self.summary.shadowed_candidate_count,
-                OverflowError::ShadowedCandidateCount,
-            )
-            .map_err(ScanError::Overflow)?;
-        } else {
+        if !shadowed {
             // Only a winning reading is evidence for the next shadow decision.
             match encoding {
                 Encoding::ASCII => self.last_ascii = Some(range),
@@ -740,8 +730,9 @@ impl<'a, S: StringSink> Scanner<'a, S> {
             return false;
         }
 
-        // Both readings decode the same bytes. Prefer a lane established by the
-        // source boundary or an adjacent terminated hit.
+        // Both readings decode the same bytes. Prefer the lane that the source start or an
+        // adjacent hit establishes, then the lane whose previous code unit is a NUL
+        // terminator, then little-endian, the common case.
         let winner_evidence = winner_range.start == 0
             || follows_utf16_neighbor(self.last_utf16[winner_index], winner_range);
         let candidate_evidence = candidate_range.start == 0
@@ -749,8 +740,9 @@ impl<'a, S: StringSink> Scanner<'a, S> {
         if winner_evidence != candidate_evidence {
             return winner_evidence;
         }
-        // Without deciding evidence, read UTF-16 as little-endian, as FLOSS and YARA `wide` do.
-        // The big-endian reading is still reported, shadowed.
+        if winner_range.follows_nul != candidate_range.follows_nul {
+            return winner_range.follows_nul;
+        }
         winner_encoding == Encoding::UTF16LE
     }
 
@@ -789,6 +781,7 @@ impl From<&Candidate> for CandidateRange {
             end: candidate.end,
             character_count: candidate.character_count,
             ascii_character_count: candidate.ascii_character_count,
+            follows_nul: candidate.follows_nul,
         }
     }
 }
@@ -829,20 +822,10 @@ fn utf16_shadows_shifted(winner: CandidateRange, candidate: CandidateRange) -> b
 
 /// Whether two UTF-16 readings of opposite endianness decode the same bytes one byte apart.
 ///
-/// At opposite byte alignments, every code unit of one reading straddles two adjacent code
-/// units of the other: a UTF-16LE unit `lo hi` at `s` is followed by `lo' hi'`, and the
-/// UTF-16BE unit at `s + 1` is `hi lo'`. When the text's characters share one high byte, as
-/// ASCII (U+00xx), Greek (U+03xx), or Cyrillic (U+04xx) text does, that unit is the next
-/// character, so the opposite lane reads nearly the same text. The same holds for a real
-/// UTF-16BE string read by the UTF-16LE lane one byte later.
-///
-/// The readings pair when one lies inside the other's span widened by one byte at each end,
-/// the byte its first or last unit straddles. Two genuine strings cannot share bytes, so the
-/// inner reading re-reads bytes the outer one already decoded. Containment, rather than an
-/// overlap fraction or a one-byte start difference, also pairs the pieces of a copy that a
-/// script change splits: in "\П" read one byte off, the unit `00 1F` is the control U+001F,
-/// so the big-endian copy of `C:\Users\Пользователь` breaks into `C:\Users\` and
-/// `ользователь` plus one straddled character, and each piece lies inside the original.
+/// The readings pair when one lies inside the other's span widened by one byte at each end.
+/// Two genuine strings cannot share bytes, so the inner reading re-reads bytes the outer one
+/// decoded. Containment, rather than equal spans, also pairs each piece of a copy that a
+/// control code unit splits.
 fn is_opposite_endian_shift(
     first_encoding: Encoding,
     first: CandidateRange,
@@ -971,12 +954,22 @@ impl Decoder {
         };
         *high_surrogate = Some((offset, unit));
     }
+
+    /// Records whether the current code unit is NUL and returns whether the previous one was.
+    fn replace_previous_unit_nul(&mut self, is_nul: bool) -> bool {
+        let DecoderKind::Utf16 {
+            previous_unit_nul, ..
+        } = &mut self.kind
+        else {
+            unreachable!("only UTF-16 decoders have UTF-16 code unit state")
+        };
+        std::mem::replace(previous_unit_nul, is_nul)
+    }
 }
 
 /// Whether `character` can be part of a decoded string: any non-control character except the
-/// Unicode line and paragraph separators, plus tab. Every line break ends the string, as in GNU
-/// `strings` without `--include-all-whitespace`, so each line of embedded text is its own hit
-/// with its own source offset, and no hit contains a character that a line splitter breaks on.
+/// Unicode line and paragraph separators, plus tab. Line breaks end a string, as in GNU
+/// `strings` without `--include-all-whitespace`.
 fn is_string_character(character: char) -> bool {
     (!character.is_control() && !matches!(character, '\u{2028}' | '\u{2029}')) || character == '\t'
 }

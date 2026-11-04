@@ -21,9 +21,6 @@ struct Opts {
     encoding: Option<String>,
     #[clap(short, long)]
     offset: bool,
-    /// also print shadowed readings: UTF-16 views of bytes that another reading already reports
-    #[clap(short, long)]
-    shadowed: bool,
 }
 
 fn get_file_path(options: &Opts) -> String {
@@ -81,9 +78,6 @@ fn main() {
     }
     .expect("Something went wrong!");
     for hit in extracted_strings {
-        if hit.finish.shadowed && !options.shadowed {
-            continue;
-        }
         if options.offset {
             println!("{:10}: {}", hit.start.offset.get(), hit.text);
         } else {

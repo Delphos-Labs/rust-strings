@@ -27,8 +27,6 @@ struct PyStringHit {
     character_count: u64,
     #[pyo3(get)]
     decoded_utf8_length: u64,
-    #[pyo3(get)]
-    shadowed: bool,
 }
 
 impl From<RustStringHit> for PyStringHit {
@@ -46,7 +44,6 @@ impl From<RustStringHit> for PyStringHit {
             encoding: encoding.to_owned(),
             character_count: hit.finish.character_count,
             decoded_utf8_length: hit.finish.decoded_utf8_length,
-            shadowed: hit.finish.shadowed,
         }
     }
 }
@@ -63,7 +60,7 @@ impl From<EncodingNotFoundError> for PyErr {
 /// :param min_length: strings minimum length
 /// :param encoding: strings encoding (default is ["ascii"]; options are "ascii", "utf-8", "utf-16le", "utf-16be")
 /// :param buffer_size: the buffer size to read the file (relevant only to file_path option)
-/// :return: list of typed string hits with source and decoded metadata, shadowed readings included
+/// :return: list of typed string hits with source and decoded metadata
 /// :raises: raise StringsException if there is any error during string extraction
 ///          raise EncodingNotFoundException if the function got an unsupported encondings
 #[pyfunction()]
@@ -117,7 +114,7 @@ fn strings(
     })
 }
 
-/// Dump strings from binary file or bytes to a json file of [text, offset, shadowed] arrays.
+/// Dump strings from binary file or bytes to json file.
 /// :param output_file: path to file to dump into
 /// :param file_path: path to file (can't be with bytes option)
 /// :param bytes: bytes (can't be with file_path option)

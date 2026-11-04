@@ -15,8 +15,6 @@ class StringHit:
     def character_count(self) -> int: ...
     @property
     def decoded_utf8_length(self) -> int: ...
-    @property
-    def shadowed(self) -> bool: ...
 
 
 def strings(
@@ -33,7 +31,7 @@ def strings(
     :param min_length: strings minimum length
     :param encodings: strings encodings (default is ["ascii"]; options are "ascii", "utf-8", "utf-16le", "utf-16be")
     :param buffer_size: the buffer size to read the file (relevant only to file_path option)
-    :return: typed hits with source and decoded metadata, shadowed readings included
+    :return: typed hits with source and decoded metadata
     :raises: raise StringsException if there is any error during string extraction
              raise EncodingNotFoundException if the function got an unsupported encondings
     """
@@ -49,7 +47,7 @@ def dump_strings(
     buffer_size: int = 1024 * 1024,
 ) -> None:
     """
-    Dump strings from binary file or bytes to a json file of [text, offset, shadowed] arrays.
+    Dump strings from binary file or bytes to json file.
     :param output_file: path to file to dump into
     :param file_path: path to file (can't be with bytes option)
     :param bytes: bytes (can't be with file_path option)
