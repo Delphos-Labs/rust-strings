@@ -101,8 +101,10 @@ candidate and scan the input.
 
 A string holds printable characters and tab. Other control characters end it,
 including line feed and carriage return, as in GNU `strings` without
-`--include-all-whitespace`. Each line of embedded text is therefore its own hit
-with its own source offset.
+`--include-all-whitespace`. The Unicode line and paragraph separators (U+2028,
+U+2029) end a UTF-16 string too. Each line of embedded text is therefore its own
+hit with its own source offset, and no hit contains a character that a line
+splitter breaks on.
 
 ### Ordering and suppression
 

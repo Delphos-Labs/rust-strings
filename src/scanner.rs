@@ -792,11 +792,12 @@ impl Decoder {
     }
 }
 
-/// Whether `character` can be part of a decoded string: any non-control character, plus tab.
-/// A line break ends the string, as in GNU `strings` without `--include-all-whitespace`, so each
-/// line of embedded text is its own hit with its own source offset.
+/// Whether `character` can be part of a decoded string: any non-control character except the
+/// Unicode line and paragraph separators, plus tab. Every line break ends the string, as in GNU
+/// `strings` without `--include-all-whitespace`, so each line of embedded text is its own hit
+/// with its own source offset, and no hit contains a character that a line splitter breaks on.
 fn is_string_character(character: char) -> bool {
-    !character.is_control() || character == '\t'
+    (!character.is_control() && !matches!(character, '\u{2028}' | '\u{2029}')) || character == '\t'
 }
 
 /// The ASCII form of [`is_string_character`]: printable ASCII plus tab.

@@ -161,7 +161,7 @@ fn line_breaks_end_candidates_and_tabs_stay_inside() {
     assert_eq!(sink.records.len(), 3, "{:?}", sink.records);
 
     for (encoding, big_endian) in [(Encoding::UTF16LE, false), (Encoding::UTF16BE, true)] {
-        let bytes = utf16("line one\r\nline two", big_endian, 0);
+        let bytes = utf16("line one\r\nline two\u{2028}line six", big_endian, 0);
         let mut reader = bytes.as_slice();
         let mut sink = CollectSink::default();
         scan(&mut reader, &options(4, &[encoding]), &mut sink).unwrap();
@@ -170,15 +170,19 @@ fn line_breaks_end_candidates_and_tabs_stay_inside() {
             matching_record(&sink, "line one", 0).start.encoding,
             encoding
         );
-        // "line one" and "\r\n" are ten UTF-16 code units.
+        // "line one" and "\r\n" are ten UTF-16 code units; "line two" and U+2028 nine more.
         assert_eq!(
             matching_record(&sink, "line two", 20).start.encoding,
+            encoding
+        );
+        assert_eq!(
+            matching_record(&sink, "line six", 38).start.encoding,
             encoding
         );
         assert!(
             sink.records
                 .iter()
-                .all(|record| !record.text.contains(['\n', '\r'])),
+                .all(|record| !record.text.contains(['\n', '\r', '\u{2028}'])),
             "{:?}",
             sink.records
         );
