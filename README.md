@@ -132,8 +132,8 @@ At EOF, it closes decoders in the same order.
 ### Shadowed readings
 
 When two decoders read nearly the same bytes, the losing reading still
-finishes, with `HitFinish::shadowed` set to `true`. A shadowed hit ends when
-its winner ends, so it holds only the characters decoded until then, and its
+finishes, with `HitFinish::shadowed` set to `true`. A shadowed hit ends at its
+own end, or where its winner ends if the winner finishes first, and its
 decoder continues with a fresh candidate. A shadowed hit is not evidence for
 later decisions about its decoder lane, and `ScanSummary::candidate_count`
 does not count it. `strings`, `dump_strings`, the Python bindings, and the
@@ -149,15 +149,14 @@ Only UTF-16 readings are shadowed. The rules are:
   shadowed too.
 - An all-ASCII UTF-16 hit shadows its one-byte shifted suffix and non-ASCII
   shifted copy. Where this rule applies, it decides the pair.
-- UTF-16LE and UTF-16BE readings at opposite byte alignments re-read the same
-  bytes. Text whose characters share one high byte, such as ASCII, Greek, or
-  Cyrillic, reads as nearly the same text in both: UTF-16LE `Пароль: %s` at
-  0x28 reads as UTF-16BE `арольк %s` at 0x29. Two such readings pair when one
-  lies inside the other's span widened by one byte at each end, which also
-  pairs each piece of a copy that a control character splits. The scanner
-  prefers the lane that starts at source offset zero or continues one NUL code
-  unit after its previous unshadowed hit, then UTF-16LE, the common case. Real
-  UTF-16BE text with neither loses to its UTF-16LE copy.
+- UTF-16LE and UTF-16BE readings at opposite byte alignments overlap. Text
+  whose characters share one high byte, such as ASCII, Greek, or Cyrillic,
+  reads as nearly the same text in both. Two such readings pair when one lies
+  inside the other's span widened by one byte at each end. When paired
+  readings start one byte apart, the scanner prefers the lane that starts at
+  source offset zero or continues one NUL code unit after its previous
+  unshadowed hit; otherwise, and when neither or both lanes have that
+  evidence, it prefers UTF-16LE, the common case.
 - Other overlapping readings, such as a same-endian reading of non-ASCII text
   at the other alignment, stay unshadowed because the bytes do not prove which
   interpretation is intentional.

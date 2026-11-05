@@ -58,8 +58,9 @@ pub struct HitFinish {
     pub character_count: u64,
     /// The complete decoded text length in UTF-8 bytes.
     pub decoded_utf8_length: u64,
-    /// Whether another reading of the same source bytes won. A shadowed hit ends when its
-    /// winner ends; the README lists the rules.
+    /// Whether another reading of overlapping source bytes won. A shadowed hit ends at its
+    /// own end, or where its winner ends if the winner finishes first. The README lists the
+    /// rules.
     pub shadowed: bool,
 }
 
@@ -223,7 +224,7 @@ pub struct ScanSummary {
     pub bytes_read: u64,
     /// The unshadowed candidates completed through `StringSink::finish`.
     pub candidate_count: u64,
-    /// The completed candidates, shadowed or not, for which the sink skipped text.
+    /// The unshadowed candidates for which the sink skipped text.
     pub skipped_candidate_count: u64,
 }
 
@@ -433,13 +434,15 @@ impl<'a, S: StringSink> Scanner<'a, S> {
                         self.finish_detected_candidate(index)?;
                     }
                 }
-                DecoderKind::Utf8 { .. } => {
-                    if self.decoders[index].interrupt_utf8_sequence(byte) {
+                DecoderKind::Utf8 { ref mut pending } => {
+                    let interrupted = interrupt_utf8_sequence(pending, byte);
+                    let step = consume_utf8_byte(pending, offset, byte);
+                    if interrupted {
                         // The incomplete sequence is a maximal subpart of an ill-formed
                         // sequence; this byte may start the next well-formed one.
                         self.finish_detected_candidate(index)?;
                     }
-                    match self.decoders[index].consume_utf8_byte(offset, byte) {
+                    match step {
                         Utf8Step::Pending => {}
                         Utf8Step::Scalar {
                             offset,
@@ -641,13 +644,13 @@ impl<'a, S: StringSink> Scanner<'a, S> {
                 OverflowError::CandidateCount,
             )
             .map_err(ScanError::Overflow)?;
-        }
-        if open.skipped {
-            checked_increment(
-                &mut self.summary.skipped_candidate_count,
-                OverflowError::SkippedCandidateCount,
-            )
-            .map_err(ScanError::Overflow)?;
+            if open.skipped {
+                checked_increment(
+                    &mut self.summary.skipped_candidate_count,
+                    OverflowError::SkippedCandidateCount,
+                )
+                .map_err(ScanError::Overflow)?;
+            }
         }
         Ok(())
     }
@@ -719,14 +722,17 @@ impl<'a, S: StringSink> Scanner<'a, S> {
             return false;
         }
 
-        // Both readings decode the same bytes. Prefer the lane that the source start or an
-        // adjacent hit establishes, then little-endian, the common case: real big-endian text
-        // with neither loses to its little-endian copy.
+        // The readings overlap. When they start one byte apart, one re-reads the other's
+        // bytes: prefer the lane that the source start or an adjacent hit establishes. Then
+        // prefer little-endian, the common case: real big-endian text with neither loses to
+        // its little-endian copy.
         let winner_evidence = winner_range.start == 0
             || follows_utf16_neighbor(self.last_utf16[winner_index], winner_range);
         let candidate_evidence = candidate_range.start == 0
             || follows_utf16_neighbor(self.last_utf16[candidate_index], candidate_range);
-        if winner_evidence != candidate_evidence {
+        if winner_evidence != candidate_evidence
+            && winner_range.start.abs_diff(candidate_range.start) == 1
+        {
             return winner_evidence;
         }
         winner_encoding == Encoding::UTF16LE
@@ -805,7 +811,7 @@ fn utf16_shadows_shifted(winner: CandidateRange, candidate: CandidateRange) -> b
     shifted_suffix || non_ascii_copy
 }
 
-/// Whether two UTF-16 readings of opposite endianness decode the same bytes one byte apart.
+/// Whether two UTF-16 readings of opposite endianness and opposite alignment overlap.
 ///
 /// The readings pair when one lies inside the other's span widened by one byte at each end.
 /// Two genuine strings cannot share bytes, so the inner reading re-reads bytes the outer one
@@ -836,72 +842,66 @@ fn follows_utf16_neighbor(previous: Option<CandidateRange>, candidate: Candidate
     previous.and_then(|range| range.end.checked_add(2)) == Some(candidate.start)
 }
 
-impl Decoder {
-    /// Ends an incomplete UTF-8 sequence that `byte` cannot continue, and reports whether it
-    /// did. The caller then passes `byte` to [`Self::consume_utf8_byte`] as a new sequence.
-    fn interrupt_utf8_sequence(&mut self, byte: u8) -> bool {
-        let DecoderKind::Utf8 { pending } = &mut self.kind else {
-            unreachable!("only the UTF-8 decoder has UTF-8 sequence state")
-        };
-        match pending {
-            Some(sequence) if !(sequence.next.0..=sequence.next.1).contains(&byte) => {
-                *pending = None;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Decodes well-formed UTF-8 as defined by Unicode Table 3-7 and RFC 3629, which excludes
-    /// overlong forms, surrogate code points, and values above U+10FFFF.
-    fn consume_utf8_byte(&mut self, offset: u64, byte: u8) -> Utf8Step {
-        let DecoderKind::Utf8 { pending } = &mut self.kind else {
-            unreachable!("only the UTF-8 decoder has UTF-8 sequence state")
-        };
-        if let Some(sequence) = pending.as_mut() {
-            debug_assert!((sequence.next.0..=sequence.next.1).contains(&byte));
-            sequence.value = (sequence.value << 6) | u32::from(byte & 0x3f);
-            sequence.remaining -= 1;
-            sequence.next = (0x80, 0xbf);
-            if sequence.remaining > 0 {
-                return Utf8Step::Pending;
-            }
-            let start = sequence.start;
-            let value = sequence.value;
+/// Ends an incomplete UTF-8 sequence that `byte` cannot continue, and reports whether it
+/// did. The caller then passes `byte` to [`consume_utf8_byte`] as a new sequence.
+fn interrupt_utf8_sequence(pending: &mut Option<Utf8Sequence>, byte: u8) -> bool {
+    match pending {
+        Some(sequence) if !(sequence.next.0..=sequence.next.1).contains(&byte) => {
             *pending = None;
-            return Utf8Step::Scalar {
-                offset: start,
-                width: offset - start + 1,
-                character: char::from_u32(value).expect("Table 3-7 admits only scalar values"),
-            };
+            true
         }
-        let (value, remaining, next) = match byte {
-            0x00..=0x7f => {
-                return Utf8Step::Scalar {
-                    offset,
-                    width: 1,
-                    character: char::from(byte),
-                }
-            }
-            0xc2..=0xdf => (byte & 0x1f, 1, (0x80, 0xbf)),
-            0xe0 => (byte & 0x0f, 2, (0xa0, 0xbf)),
-            0xe1..=0xec | 0xee..=0xef => (byte & 0x0f, 2, (0x80, 0xbf)),
-            0xed => (byte & 0x0f, 2, (0x80, 0x9f)),
-            0xf0 => (byte & 0x07, 3, (0x90, 0xbf)),
-            0xf1..=0xf3 => (byte & 0x07, 3, (0x80, 0xbf)),
-            0xf4 => (byte & 0x07, 3, (0x80, 0x8f)),
-            // C0, C1, and F5..FF never occur; 80..BF cannot start a sequence.
-            _ => return Utf8Step::IllFormed,
-        };
-        *pending = Some(Utf8Sequence {
-            start: offset,
-            value: u32::from(value),
-            remaining,
-            next,
-        });
-        Utf8Step::Pending
+        _ => false,
     }
+}
 
+/// Decodes well-formed UTF-8 as defined by Unicode Table 3-7 and RFC 3629, which excludes
+/// overlong forms, surrogate code points, and values above U+10FFFF.
+fn consume_utf8_byte(pending: &mut Option<Utf8Sequence>, offset: u64, byte: u8) -> Utf8Step {
+    if let Some(sequence) = pending.as_mut() {
+        debug_assert!((sequence.next.0..=sequence.next.1).contains(&byte));
+        sequence.value = (sequence.value << 6) | u32::from(byte & 0x3f);
+        sequence.remaining -= 1;
+        sequence.next = (0x80, 0xbf);
+        if sequence.remaining > 0 {
+            return Utf8Step::Pending;
+        }
+        let start = sequence.start;
+        let value = sequence.value;
+        *pending = None;
+        return Utf8Step::Scalar {
+            offset: start,
+            width: offset - start + 1,
+            character: char::from_u32(value).expect("Table 3-7 admits only scalar values"),
+        };
+    }
+    let (value, remaining, next) = match byte {
+        0x00..=0x7f => {
+            return Utf8Step::Scalar {
+                offset,
+                width: 1,
+                character: char::from(byte),
+            }
+        }
+        0xc2..=0xdf => (byte & 0x1f, 1, (0x80, 0xbf)),
+        0xe0 => (byte & 0x0f, 2, (0xa0, 0xbf)),
+        0xe1..=0xec | 0xee..=0xef => (byte & 0x0f, 2, (0x80, 0xbf)),
+        0xed => (byte & 0x0f, 2, (0x80, 0x9f)),
+        0xf0 => (byte & 0x07, 3, (0x90, 0xbf)),
+        0xf1..=0xf3 => (byte & 0x07, 3, (0x80, 0xbf)),
+        0xf4 => (byte & 0x07, 3, (0x80, 0x8f)),
+        // C0, C1, and F5..FF never occur; 80..BF cannot start a sequence.
+        _ => return Utf8Step::IllFormed,
+    };
+    *pending = Some(Utf8Sequence {
+        start: offset,
+        value: u32::from(value),
+        remaining,
+        next,
+    });
+    Utf8Step::Pending
+}
+
+impl Decoder {
     fn consume_utf16_byte(&mut self, offset: u64, byte: u8) -> Option<(u64, u16)> {
         let DecoderKind::Utf16 {
             big_endian,

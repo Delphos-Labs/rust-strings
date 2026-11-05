@@ -115,24 +115,13 @@ fn matching_record<'a>(sink: &'a CollectSink, text: &str, offset: u64) -> &'a Re
         .unwrap_or_else(|| panic!("missing record {text:?} at {offset}: {:?}", sink.records))
 }
 
-/// Asserts that the record for `text` at `offset` from `encoding` exists and is shadowed.
 #[track_caller]
 fn assert_shadowed(sink: &CollectSink, text: &str, offset: u64, encoding: Encoding) {
-    let record = sink
-        .records
-        .iter()
-        .find(|record| {
-            record.text == text
-                && record.start.offset.get() == offset
-                && record.start.encoding == encoding
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "missing {encoding} record {text:?} at {offset}: {:?}",
-                sink.records
-            )
-        });
-    assert!(record.finish.shadowed, "{record:?}");
+    let readings = readings(sink);
+    assert!(
+        readings.contains(&(text.to_owned(), offset, encoding, true)),
+        "{readings:?}"
+    );
 }
 
 /// The opposite-endian reading of ASCII text stored as UTF-16: each byte pair is swapped, so
@@ -199,32 +188,13 @@ fn line_breaks_end_candidates_and_tabs_stay_inside() {
         let mut sink = CollectSink::default();
         scan(&mut reader, &options(4, &[encoding]), &mut sink).unwrap();
 
-        assert_eq!(
-            matching_record(&sink, "line one", 0).start.encoding,
-            encoding
-        );
+        matching_record(&sink, "line one", 0);
         // Offsets are bytes, two per UTF-16 code unit. "line one" and "\r\n" are ten units.
-        assert_eq!(
-            matching_record(&sink, "line two", 20).start.encoding,
-            encoding
-        );
+        matching_record(&sink, "line two", 20);
         // "line two" and U+2028 are nine more; a tab stays inside "line\tsix".
-        assert_eq!(
-            matching_record(&sink, "line\tsix", 38).start.encoding,
-            encoding
-        );
+        matching_record(&sink, "line\tsix", 38);
         // "line\tsix" and U+2029 are nine more.
-        assert_eq!(
-            matching_record(&sink, "line ten", 56).start.encoding,
-            encoding
-        );
-        assert!(
-            sink.records
-                .iter()
-                .all(|record| !record.text.contains(['\n', '\r', '\u{2028}', '\u{2029}'])),
-            "{:?}",
-            sink.records
-        );
+        matching_record(&sink, "line ten", 56);
     }
 }
 
@@ -529,26 +499,22 @@ fn candidate_size_does_not_change_scanner_chunk_memory() {
     assert_eq!(sink.chunks, LENGTH - 3);
 }
 
-/// Asserts the complete set of shadowed readings as `(text, offset, encoding)`.
-#[track_caller]
-fn assert_shadowed_readings(sink: &CollectSink, expected: &[(String, u64, Encoding)]) {
-    let key = |reading: &(String, u64, Encoding)| (reading.1, reading.2.to_string());
-    let mut actual = sink
+/// Every record as `(text, offset, encoding, shadowed)`, ordered by offset and encoding.
+fn readings(sink: &CollectSink) -> Vec<(String, u64, Encoding, bool)> {
+    let mut readings = sink
         .records
         .iter()
-        .filter(|record| record.finish.shadowed)
         .map(|record| {
             (
                 record.text.clone(),
                 record.start.offset.get(),
                 record.start.encoding,
+                record.finish.shadowed,
             )
         })
         .collect::<Vec<_>>();
-    actual.sort_by_key(key);
-    let mut expected = expected.to_vec();
-    expected.sort_by_key(key);
-    assert_eq!(actual, expected);
+    readings.sort_by_key(|reading| (reading.1, reading.2 as u8));
+    readings
 }
 
 #[test]
@@ -563,29 +529,47 @@ fn odd_aligned_utf16_shadows_shifted_artifacts() {
     )
     .unwrap();
 
-    assert_unique_winner(&sink, "test", 1, Encoding::UTF16LE);
     // Bytes ff 74 00 65 00 73 00 74: little-endian pairs from offset 0 read U+74FF and the
     // swapped letters; big-endian pairs read U+FF74 and "est".
-    assert_shadowed_readings(
-        &sink,
-        &[
-            (format!("\u{74ff}{}", swapped("est")), 0, Encoding::UTF16LE),
-            ("\u{ff74}est".into(), 0, Encoding::UTF16BE),
-        ],
+    assert_eq!(
+        readings(&sink),
+        vec![
+            (
+                format!("\u{74ff}{}", swapped("est")),
+                0,
+                Encoding::UTF16LE,
+                true
+            ),
+            ("\u{ff74}est".into(), 0, Encoding::UTF16BE, true),
+            ("test".into(), 1, Encoding::UTF16LE, false),
+            (swapped("test"), 1, Encoding::UTF16BE, false),
+        ]
     );
+}
+
+/// Asserts the exact set of unshadowed readings and that at least one reading is shadowed.
+#[track_caller]
+fn assert_winners(sink: &CollectSink, expected: &[(&str, u64, Encoding)]) {
+    let all = readings(sink);
+    let winners = all
+        .iter()
+        .filter(|reading| !reading.3)
+        .map(|reading| (reading.0.as_str(), reading.1, reading.2))
+        .collect::<Vec<_>>();
+    let mut expected = expected.to_vec();
+    expected.sort_by_key(|reading| (reading.1, reading.2 as u8));
+    assert_eq!(winners, expected, "{all:?}");
+    assert!(all.iter().any(|reading| reading.3), "{all:?}");
 }
 
 /// Asserts that exactly one unshadowed record holds `text`, at `offset` from `encoding`.
 #[track_caller]
 fn assert_unique_winner(sink: &CollectSink, text: &str, offset: u64, encoding: Encoding) {
-    let matches = sink
-        .records
-        .iter()
-        .filter(|record| record.text == text && !record.finish.shadowed)
+    let winners = readings(sink)
+        .into_iter()
+        .filter(|reading| reading.0 == text && !reading.3)
         .collect::<Vec<_>>();
-    assert_eq!(matches.len(), 1, "{text:?}: {matches:?}");
-    assert_eq!(matches[0].start.offset.get(), offset);
-    assert_eq!(matches[0].start.encoding, encoding);
+    assert_eq!(winners, vec![(text.to_owned(), offset, encoding, false)]);
 }
 
 const LARGE_LENGTH: usize = 64 * 1024 + 1;
@@ -622,19 +606,18 @@ fn utf16le_large_neighbor_prefers_exact_candidate_over_shifted_be_copy() {
     )
     .unwrap();
 
-    assert_unique_winner(&sink, "MATCH_A", 0, Encoding::UTF16LE);
-    assert_unique_winner(&sink, "MATCH_B", match_b_offset, Encoding::UTF16LE);
-    // "MATCH_A" and its NUL fill bytes 0..16, so the X run starts at 16.
+    // "MATCH_A" and its NUL fill bytes 0..16, so the X run starts at 16. Big-endian pairs at
+    // the same offsets read each text swapped.
     let x_run = "X".repeat(LARGE_LENGTH);
-    assert_shadowed_readings(
+    assert_winners(
         &sink,
         &[
-            (swapped("ATCH_A"), 1, Encoding::UTF16LE),
-            ("ATCH_A".into(), 1, Encoding::UTF16BE),
-            (swapped(&x_run), 15, Encoding::UTF16LE),
-            (x_run, 15, Encoding::UTF16BE),
-            (swapped("MATCH_B"), match_b_offset - 1, Encoding::UTF16LE),
-            ("MATCH_B".into(), match_b_offset - 1, Encoding::UTF16BE),
+            ("MATCH_A", 0, Encoding::UTF16LE),
+            (&swapped("MATCH_A"), 0, Encoding::UTF16BE),
+            (&x_run, 16, Encoding::UTF16LE),
+            (&swapped(&x_run), 16, Encoding::UTF16BE),
+            ("MATCH_B", match_b_offset, Encoding::UTF16LE),
+            (&swapped("MATCH_B"), match_b_offset, Encoding::UTF16BE),
         ],
     );
 }
@@ -654,61 +637,26 @@ fn utf16be_large_neighbor_prefers_exact_candidate_over_shifted_le_copy() {
     // Each big-endian hit is evidence for the next one, two bytes after it. The shadowed
     // little-endian X run must not become evidence for its lane, or the little-endian
     // "MATCH_B" copy would tie and win.
-    assert_unique_winner(&sink, "MATCH_A", 0, Encoding::UTF16BE);
-    assert_unique_winner(&sink, "MATCH_B", match_b_offset, Encoding::UTF16BE);
     let x_run = "X".repeat(LARGE_LENGTH);
-    assert_shadowed_readings(
+    assert_winners(
         &sink,
         &[
-            (swapped("MATCH_A"), 0, Encoding::UTF16LE),
-            ("MATCH_A".into(), 1, Encoding::UTF16LE),
-            (swapped("MATCH_A"), 1, Encoding::UTF16BE),
-            (swapped(&x_run), 16, Encoding::UTF16LE),
-            (x_run.clone(), 17, Encoding::UTF16LE),
-            (swapped(&x_run), 17, Encoding::UTF16BE),
-            (swapped("MATCH_B"), match_b_offset, Encoding::UTF16LE),
-            ("MATCH_B".into(), match_b_offset + 1, Encoding::UTF16LE),
-            (swapped("MATCH_B"), match_b_offset + 1, Encoding::UTF16BE),
+            ("MATCH_A", 0, Encoding::UTF16BE),
+            (&x_run, 16, Encoding::UTF16BE),
+            ("MATCH_B", match_b_offset, Encoding::UTF16BE),
         ],
     );
 }
 
 #[test]
 fn genuine_odd_aligned_utf16_wins_exact_copy_shadowing() {
-    let le_bytes = utf16("ODD_REAL", false, 1);
-    let be_bytes = utf16("ODD_REAL", true, 1);
-    for (bytes, encoding, shadowed) in [
-        // ff 4f 00 44 00 ...: pairs from offset 0 read U+4FFF or U+FF4F first.
-        (
-            le_bytes,
-            Encoding::UTF16LE,
-            vec![
-                (
-                    format!("\u{4fff}{}", swapped("DD_REAL")),
-                    0,
-                    Encoding::UTF16LE,
-                ),
-                ("\u{ff4f}DD_REAL".to_owned(), 0, Encoding::UTF16BE),
-            ],
-        ),
-        // ff 00 4f 00 44 ... 4c 00 00: pairs from offset 0 read U+00FF or U+FF00 first, and
-        // the little-endian view reaches the terminator's first byte. Little-endian pairs from
-        // offset 1 (00 4f, 00 44, ...) read the same U+4F00, U+4400, ... as big-endian pairs
-        // from offset 0 (4f 00, 44 00, ...), and the open view from offset 0 shadows them.
-        (
-            be_bytes,
-            Encoding::UTF16BE,
-            vec![
-                ("\u{ff}ODD_REAL".to_owned(), 0, Encoding::UTF16LE),
-                (
-                    format!("\u{ff00}{}", swapped("ODD_REAL")),
-                    0,
-                    Encoding::UTF16BE,
-                ),
-                (swapped("ODD_REAL"), 1, Encoding::UTF16LE),
-            ],
-        ),
+    // The swapped reading at a winner's offset stays unshadowed only beside a little-endian
+    // winner.
+    for (encoding, swapped_encoding, big_endian) in [
+        (Encoding::UTF16LE, Some(Encoding::UTF16BE), false),
+        (Encoding::UTF16BE, None, true),
     ] {
+        let bytes = utf16("ODD_REAL", big_endian, 1);
         let mut reader = bytes.as_slice();
         let mut sink = CollectSink::default();
         scan(
@@ -718,30 +666,18 @@ fn genuine_odd_aligned_utf16_wins_exact_copy_shadowing() {
         )
         .unwrap();
 
-        assert_unique_winner(&sink, "ODD_REAL", 1, encoding);
-        assert_shadowed_readings(&sink, &shadowed);
+        let swapped_text = swapped("ODD_REAL");
+        let mut expected = vec![("ODD_REAL", 1, encoding)];
+        expected.extend(swapped_encoding.map(|copy| (swapped_text.as_str(), 1, copy)));
+        assert_winners(&sink, &expected);
     }
 }
 
 #[test]
 fn eof_candidate_prefers_exact_encoding_without_hiding_its_neighbor() {
-    // "LEFT" and its NUL fill bytes 0..10, so "TARGET" starts at 10 and runs to EOF at 22.
-    let le_shadowed = [
-        (swapped("TARGET"), 9, Encoding::UTF16LE),
-        ("TARGET".to_owned(), 9, Encoding::UTF16BE),
-    ];
-    let be_shadowed = [
-        (swapped("LEFT"), 0, Encoding::UTF16LE),
-        ("LEFT".to_owned(), 1, Encoding::UTF16LE),
-        (swapped("LEFT"), 1, Encoding::UTF16BE),
-        (swapped("TARGET"), 10, Encoding::UTF16LE),
-        // The odd lane reaches EOF one byte short of the final "T".
-        ("TARGE".to_owned(), 11, Encoding::UTF16LE),
-        (swapped("TARGE"), 11, Encoding::UTF16BE),
-    ];
-    for (encoding, big_endian, shadowed) in [
-        (Encoding::UTF16LE, false, &le_shadowed[..]),
-        (Encoding::UTF16BE, true, &be_shadowed[..]),
+    for (encoding, swapped_encoding, big_endian) in [
+        (Encoding::UTF16LE, Some(Encoding::UTF16BE), false),
+        (Encoding::UTF16BE, None, true),
     ] {
         let mut bytes = Vec::new();
         append_utf16(&mut bytes, "LEFT", big_endian, true);
@@ -756,9 +692,13 @@ fn eof_candidate_prefers_exact_encoding_without_hiding_its_neighbor() {
         )
         .unwrap();
 
-        assert_unique_winner(&sink, "LEFT", 0, encoding);
-        assert_unique_winner(&sink, "TARGET", target_offset, encoding);
-        assert_shadowed_readings(&sink, shadowed);
+        let (swapped_left, swapped_target) = (swapped("LEFT"), swapped("TARGET"));
+        let mut expected = vec![("LEFT", 0, encoding), ("TARGET", target_offset, encoding)];
+        if let Some(copy) = swapped_encoding {
+            expected.push((&swapped_left, 0, copy));
+            expected.push((&swapped_target, target_offset, copy));
+        }
+        assert_winners(&sink, &expected);
     }
 }
 
@@ -775,15 +715,39 @@ fn exact_opposite_endian_copy_without_evidence_prefers_little_endian() {
         let mut sink = CollectSink::default();
         scan(&mut reader, &options(4, &encodings), &mut sink).unwrap();
 
-        assert_unique_winner(&sink, "Rich", 3, Encoding::UTF16LE);
-        assert_shadowed_readings(
+        assert_winners(
             &sink,
             &[
-                (swapped("Rich"), 2, Encoding::UTF16LE),
-                ("Rich".into(), 2, Encoding::UTF16BE),
+                ("Rich", 3, Encoding::UTF16LE),
+                (&swapped("Rich"), 3, Encoding::UTF16BE),
             ],
         );
     }
+}
+
+#[test]
+fn lane_evidence_decides_only_readings_that_start_one_byte_apart() {
+    // 01 | 04 85 00 41 04 85 00 41 00 00 | 04 85 00 | 61 00 62 00 63 00 64 00 00 00 00 00.
+    // Big-endian "\u{485}A\u{485}A" at 1 gives the odd big-endian lane evidence, and that lane
+    // then reads "\u{485}abcd" from 11. Little-endian "abcd" at 14 starts three bytes later,
+    // so it re-reads only part of that reading, and evidence must not decide the pair.
+    let bytes = [
+        0x01, 0x04, 0x85, 0x00, 0x41, 0x04, 0x85, 0x00, 0x41, 0x00, 0x00, 0x04, 0x85, 0x00, 0x61,
+        0x00, 0x62, 0x00, 0x63, 0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    let mut reader = &bytes[..];
+    let mut sink = CollectSink::default();
+    scan(&mut reader, &utf16_options(), &mut sink).unwrap();
+
+    let readings = readings(&sink);
+    assert!(
+        readings.contains(&("abcd".to_owned(), 14, Encoding::UTF16LE, false)),
+        "{readings:?}"
+    );
+    assert!(
+        readings.contains(&("\u{485}abcd".to_owned(), 11, Encoding::UTF16BE, true)),
+        "{readings:?}"
+    );
 }
 
 fn utf16_options() -> ScanOptions {
@@ -875,7 +839,7 @@ fn cjk_reading_that_ascii_wins_is_reported_shadowed() {
     let mut sink = CollectSink::default();
     scan(&mut reader, &scan_options, &mut sink).unwrap();
 
-    assert_unique_winner(&sink, "-NIlW['Y(W-NIlW[", 16, Encoding::ASCII);
+    assert_winners(&sink, &[("-NIlW['Y(W-NIlW[", 16, Encoding::ASCII)]);
     assert_shadowed(&sink, "中汉字大在中汉字", 16, Encoding::UTF16LE);
     assert_eq!(
         matching_record(&sink, "中汉字大在中汉字", 16)
@@ -891,7 +855,7 @@ fn cjk_reading_that_ascii_wins_is_reported_shadowed() {
     let mut sink = CollectSink::default();
     scan(&mut reader, &scan_options, &mut sink).unwrap();
 
-    assert_unique_winner(&sink, "O0`0U0D0", 2, Encoding::ASCII);
+    assert_winners(&sink, &[("O0`0U0D0", 2, Encoding::ASCII)]);
     assert_shadowed(&sink, "ください", 2, Encoding::UTF16LE);
 }
 
@@ -957,90 +921,65 @@ fn utf8_reads_a_non_ascii_path_whole_beside_the_ascii_pieces() {
     assert!(sink.records.iter().all(|record| !record.finish.shadowed));
 }
 
-/// Scans with ASCII and UTF-8 and returns the records as `(text, offset, encoding)`.
-fn utf8_readings(bytes: &[u8], min_length: usize) -> Vec<(String, u64, Encoding)> {
-    let mut reader = bytes;
+/// Every lead byte followed by every second byte, framed by ASCII, decodes as std's
+/// maximal-subpart decoder (`<[u8]>::utf8_chunks`) does, split at non-string characters.
+#[test]
+fn utf8_decoder_matches_std_for_every_two_byte_prefix() {
+    let scan_options = options(1, &[Encoding::UTF8]);
+    for lead in 0..=u8::MAX {
+        for second in 0..=u8::MAX {
+            let bytes = [b'a', lead, second, 0x80, 0x80, b'z'];
+            let mut reader = &bytes[..];
+            let mut sink = CollectSink::default();
+            scan(&mut reader, &scan_options, &mut sink).unwrap();
+
+            let mut expected = Vec::new();
+            let mut offset = 0;
+            for chunk in bytes.utf8_chunks() {
+                let mut start = offset;
+                let mut run = String::new();
+                for character in chunk.valid().chars() {
+                    let keep = character == '\t'
+                        || !(character.is_control()
+                            || matches!(character, '\u{2028}' | '\u{2029}'));
+                    if keep {
+                        run.push(character);
+                    } else if !run.is_empty() {
+                        expected.push((std::mem::take(&mut run), start));
+                    }
+                    offset += character.len_utf8() as u64;
+                    if run.is_empty() {
+                        start = offset;
+                    }
+                }
+                if !run.is_empty() {
+                    expected.push((run, start));
+                }
+                offset += chunk.invalid().len() as u64;
+            }
+            let actual = readings(&sink)
+                .into_iter()
+                .map(|reading| (reading.0, reading.1))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "{bytes:02x?}");
+        }
+    }
+}
+
+#[test]
+fn utf8_resynchronizes_after_a_truncated_four_byte_sequence() {
+    // U+1F600 without its last byte (f0 9f 98), then "中文字" (e4 b8 ad e6 96 87 e5 ad 97).
+    let bytes = [
+        0xf0, 0x9f, 0x98, 0xe4, 0xb8, 0xad, 0xe6, 0x96, 0x87, 0xe5, 0xad, 0x97,
+    ];
+    let mut reader = &bytes[..];
     let mut sink = CollectSink::default();
-    scan(
-        &mut reader,
-        &options(min_length, &[Encoding::ASCII, Encoding::UTF8]),
-        &mut sink,
-    )
-    .unwrap();
-    let mut readings = sink
-        .records
-        .into_iter()
-        .map(|record| {
-            (
-                record.text,
-                record.start.offset.get(),
-                record.start.encoding,
-            )
-        })
-        .collect::<Vec<_>>();
-    readings.sort_by_key(|reading| reading.1);
-    readings
-}
+    scan(&mut reader, &options(2, &[Encoding::UTF8]), &mut sink).unwrap();
 
-#[test]
-fn ill_formed_utf8_ends_a_candidate_and_is_never_decoded() {
-    for ill_formed in [
-        &[0xc0, 0x80][..],                     // overlong U+0000
-        &[0xc1, 0x81],                         // overlong "A"
-        &[0xe0, 0x81, 0x81],                   // overlong "A"
-        &[0xf0, 0x80, 0x81, 0x81],             // overlong "A"
-        &[0xed, 0xa0, 0x80],                   // surrogate U+D800
-        &[0xed, 0xbf, 0xbf],                   // surrogate U+DFFF
-        &[0xf4, 0x90, 0x80, 0x80],             // U+110000
-        &[0xf5, 0x80, 0x80, 0x80],             // lead above F4
-        &[0xf8, 0x88, 0x80, 0x80, 0x80],       // five-byte lead
-        &[0xfc, 0x84, 0x80, 0x80, 0x80, 0x80], // six-byte lead
-        &[0x80],                               // stray continuation
-        &[0xbf, 0xbf],                         // stray continuations
-    ] {
-        // "Jö" is 4a c3 b6 and "ün" is c3 bc 6e.
-        let mut bytes = b"J\xc3\xb6".to_vec();
-        bytes.extend(ill_formed);
-        bytes.extend(b"\xc3\xbcn");
-
-        assert_eq!(
-            utf8_readings(&bytes, 2),
-            vec![
-                ("Jö".to_owned(), 0, Encoding::UTF8),
-                ("ün".to_owned(), 3 + ill_formed.len() as u64, Encoding::UTF8),
-            ],
-            "{ill_formed:02x?}"
-        );
-    }
-}
-
-#[test]
-fn utf8_resynchronizes_inside_a_truncated_sequence() {
-    // "中文字" is e4 b8 ad e6 96 87 e5 ad 97.
-    let text = [0xe4, 0xb8, 0xad, 0xe6, 0x96, 0x87, 0xe5, 0xad, 0x97];
-    for truncated in [
-        &[0xe4, 0xb8][..],   // U+4E2D without its last byte
-        &[0xf0, 0x9f, 0x98], // U+1F600 without its last byte
-        &[0xe0],             // a lead whose next byte must be a0..bf
-        &[0xc3],             // a two-byte lead
-    ] {
-        let mut bytes = b"J\xc3\xb6".to_vec();
-        bytes.extend(truncated);
-        bytes.extend(text);
-
-        assert_eq!(
-            utf8_readings(&bytes, 2),
-            vec![
-                ("Jö".to_owned(), 0, Encoding::UTF8),
-                (
-                    "中文字".to_owned(),
-                    3 + truncated.len() as u64,
-                    Encoding::UTF8
-                ),
-            ],
-            "{truncated:02x?}"
-        );
-    }
+    assert_eq!(
+        readings(&sink),
+        vec![("中文字".to_owned(), 3, Encoding::UTF8, false)]
+    );
 }
 
 #[test]

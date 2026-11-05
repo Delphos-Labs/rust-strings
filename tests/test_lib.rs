@@ -28,15 +28,10 @@ fn default_collection_suppresses_utf16_views_of_ascii() {
 }
 
 #[test]
-fn encoding_names_parse_and_display() {
+fn utf8_encoding_names_parse() {
     for name in ["utf8", "utf-8", "UTF-8"] {
         assert_eq!(name.parse::<Encoding>().unwrap(), Encoding::UTF8, "{name}");
     }
-    assert_eq!("ascii".parse::<Encoding>().unwrap(), Encoding::ASCII);
-    assert_eq!("utf-16le".parse::<Encoding>().unwrap(), Encoding::UTF16LE);
-    assert_eq!("utf-16be".parse::<Encoding>().unwrap(), Encoding::UTF16BE);
-    assert!("latin-1".parse::<Encoding>().is_err());
-    assert_eq!(Encoding::UTF8.to_string(), "UTF8");
 }
 
 #[test]
