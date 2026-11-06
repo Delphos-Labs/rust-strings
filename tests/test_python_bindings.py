@@ -29,6 +29,18 @@ def test_bytes():
     assert extracted[0].decoded_utf8_length == 4
 
 
+def test_utf8():
+    # "Jörg" is 4a c3 b6 72 67; the ASCII decoder stops at c3.
+    extracted = rust_strings.strings(
+        bytes=b"\x00J\xc3\xb6rg\x00", encodings=["ascii", "utf-8"]
+    )
+    assert [(hit.text, hit.source_offset, hit.encoding) for hit in extracted] == [
+        ("Jörg", 1, "utf-8")
+    ]
+    assert extracted[0].source_byte_length == 5
+    assert extracted[0].character_count == 4
+
+
 def test_bytes_min_length_1():
     extracted = rust_strings.strings(bytes=b"test\x00", min_length=1)
     assert pairs(extracted) == [("test", 0)]
@@ -75,7 +87,7 @@ def test_multiple_encodings():
 
 def test_json_dump(temp_file: Path):
     rust_strings.dump_strings(temp_file, bytes=b'\x00\x00test"\n\tmore\x00\x00')
-    assert json.loads(temp_file.read_text()) == [['test"\n\tmore', 2]]
+    assert json.loads(temp_file.read_text()) == [['test"', 2], ["\tmore", 8]]
 
 
 def test_json_dump_multiple_strings(temp_file: Path):
@@ -83,6 +95,7 @@ def test_json_dump_multiple_strings(temp_file: Path):
         temp_file, bytes=b'\x00\x00test"\n\tmore\x00\x00more text over here'
     )
     assert json.loads(temp_file.read_text()) == [
-        ['test"\n\tmore', 2],
+        ['test"', 2],
+        ["\tmore", 8],
         ["more text over here", 15],
     ]

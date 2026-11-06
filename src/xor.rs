@@ -51,9 +51,9 @@ impl PaddedXor {
         }
     }
 
-    /// Consumes the byte at `offset` and returns a string when the byte
-    /// completes a padding run.
-    pub(crate) fn consume(&mut self, offset: u64, byte: u8, min_length: u64) -> Option<XorHit> {
+    /// Consumes the byte at `offset`. When the byte completes a padding run,
+    /// returns the strings before the run, one per line, in source order.
+    pub(crate) fn consume(&mut self, offset: u64, byte: u8, min_length: u64) -> Vec<XorHit> {
         self.window[window_index(offset)] = byte;
         if self.run_length > 0 && byte == self.run_byte {
             self.run_length = self.run_length.saturating_add(1);
@@ -66,28 +66,53 @@ impl PaddedXor {
             self.run_length = 1;
         }
         if self.run_length != MIN_PADDING_RUN {
-            return None;
+            return Vec::new();
         }
-        let key = NonZeroU8::new(self.run_byte)?;
-        self.read_back(key, min_length)
+        match NonZeroU8::new(self.run_byte) {
+            Some(key) => self.read_back(key, min_length),
+            None => Vec::new(),
+        }
     }
 
-    fn read_back(&self, key: NonZeroU8, min_length: u64) -> Option<XorHit> {
+    /// Decodes back from the run through string bytes and line breaks. A line
+    /// break ends a string, as in every other decoder, so each line is its own
+    /// hit. One letter run anywhere in the decoded text confirms the key for
+    /// every line.
+    fn read_back(&self, key: NonZeroU8, min_length: u64) -> Vec<XorHit> {
         let earliest = self
             .run_start
             .saturating_sub(MAX_STRING_BYTES)
             .max(self.boundary);
         let mut start = self.run_start;
-        while start > earliest && is_ascii_string_byte(self.decoded(start - 1, key)) {
+        while start > earliest && {
+            let byte = self.decoded(start - 1, key);
+            is_ascii_string_byte(byte) || is_line_break(byte)
+        } {
             start -= 1;
         }
-        if self.run_start - start < min_length {
-            return None;
+        if self.run_start - start < min_length
+            || !has_letter_run((start..self.run_start).map(|offset| self.decoded(offset, key)))
+        {
+            return Vec::new();
         }
-        let text = (start..self.run_start)
-            .map(|offset| char::from(self.decoded(offset, key)))
-            .collect::<String>();
-        has_letter_run(&text).then_some(XorHit { start, key, text })
+        let mut hits = Vec::new();
+        let mut line_start = start;
+        for offset in start..=self.run_start {
+            if offset == self.run_start || is_line_break(self.decoded(offset, key)) {
+                if offset - line_start >= min_length {
+                    let text = (line_start..offset)
+                        .map(|offset| char::from(self.decoded(offset, key)))
+                        .collect();
+                    hits.push(XorHit {
+                        start: line_start,
+                        key,
+                        text,
+                    });
+                }
+                line_start = offset + 1;
+            }
+        }
+        hits
     }
 
     fn decoded(&self, offset: u64, key: NonZeroU8) -> u8 {
@@ -99,9 +124,13 @@ fn window_index(offset: u64) -> usize {
     (offset % WINDOW as u64) as usize
 }
 
-fn has_letter_run(text: &str) -> bool {
+fn is_line_break(byte: u8) -> bool {
+    matches!(byte, b'\n' | b'\r')
+}
+
+fn has_letter_run(bytes: impl Iterator<Item = u8>) -> bool {
     let mut run = 0;
-    for byte in text.bytes() {
+    for byte in bytes {
         if byte.is_ascii_alphabetic() {
             run += 1;
             if run == MIN_LETTER_RUN {

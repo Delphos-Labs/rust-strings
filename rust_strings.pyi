@@ -31,7 +31,7 @@ def strings(
     :param file_path: path to file (can't be with bytes option)
     :param bytes: bytes (can't be with file_path option)
     :param min_length: strings minimum length
-    :param encodings: strings encodings (default is ["ascii"])
+    :param encodings: strings encodings (default is ["ascii"]; options are "ascii", "utf-8", "utf-16le", "utf-16be")
     :param buffer_size: the buffer size to read the file (relevant only to file_path option)
     :return: typed hits with source and decoded metadata
     :raises: raise StringsException if there is any error during string extraction
@@ -54,7 +54,7 @@ def dump_strings(
     :param file_path: path to file (can't be with bytes option)
     :param bytes: bytes (can't be with file_path option)
     :param min_length: strings minimum length
-    :param encodings: strings encodings (default is ["ascii"])
+    :param encodings: strings encodings (default is ["ascii"]; options are "ascii", "utf-8", "utf-16le", "utf-16be")
     :param buffer_size: the buffer size to read the file (relevant only to file_path option)
     :return: None
     :raises: raise StringsException if there is any error during string extraction

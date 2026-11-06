@@ -16,7 +16,7 @@ struct Opts {
     /// min length of string
     #[clap(short, long, default_value = "3")]
     min_length: usize,
-    /// encoding of string (ascii, utf16le, utf16be). Defaults to ascii and utf16le
+    /// encoding of string (ascii, utf-8, utf-16le, utf-16be). Defaults to ascii and utf-16le
     #[clap(short, long)]
     encoding: Option<String>,
     #[clap(short, long)]

@@ -61,7 +61,7 @@ impl StringSink for DiscardSink {
 }
 
 fn allocated_while_scanning(length: u64) -> usize {
-    let options = ScanOptions::new(4, [Encoding::ASCII]).unwrap();
+    let options = ScanOptions::new(4, [Encoding::ASCII, Encoding::UTF8]).unwrap();
     let mut reader = io::repeat(b'A').take(length);
     let mut sink = DiscardSink;
     ALLOCATED.store(0, Ordering::Relaxed);

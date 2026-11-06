@@ -216,6 +216,9 @@ impl StringSink for CollectSink {
 
     fn finish(&mut self, id: HitId, finish: HitFinish) -> Result<(), Self::Error> {
         let (start, text) = self.active.remove(&id).expect("active hit");
+        if finish.shadowed {
+            return Ok(());
+        }
         self.complete.push((
             id,
             StringHit {
@@ -279,8 +282,11 @@ impl<W: Write> StringSink for JsonSink<W> {
         Ok(SinkControl::Continue)
     }
 
-    fn finish(&mut self, id: HitId, _hit: HitFinish) -> Result<(), Self::Error> {
+    fn finish(&mut self, id: HitId, hit: HitFinish) -> Result<(), Self::Error> {
         let (start, text) = self.active.remove(&id).expect("active hit");
+        if hit.shadowed {
+            return Ok(());
+        }
         if !self.first {
             self.writer.write_all(b",")?;
         }

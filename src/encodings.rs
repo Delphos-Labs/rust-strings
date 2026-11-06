@@ -5,6 +5,7 @@ use std::str::FromStr;
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub enum Encoding {
     ASCII,
+    UTF8,
     UTF16LE,
     UTF16BE,
     /// ASCII XORed with one byte, found where the string's zero padding
@@ -46,9 +47,9 @@ impl FromStr for Encoding {
             "utf-16le" => Ok(Encoding::UTF16LE),
             "utf-16be" => Ok(Encoding::UTF16BE),
             "ascii" => Ok(Encoding::ASCII),
+            "utf8" => Ok(Encoding::UTF8),
+            "utf-8" => Ok(Encoding::UTF8),
             "xor-ascii" => Ok(Encoding::XorASCII),
-            "utf8" => Ok(Encoding::ASCII),
-            "utf-8" => Ok(Encoding::ASCII),
             _ => Err(EncodingNotFoundError::new(encoding.to_owned())),
         }
     }

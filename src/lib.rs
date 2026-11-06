@@ -1,6 +1,6 @@
 //! # Rust Strings
 //!
-//! `rust-strings` is a library to extract ascii strings from binary data.
+//! `rust-strings` is a library to extract ASCII, UTF-8, and UTF-16 strings from binary data.
 //! It is similar to the command `strings`.
 //!
 //! ## Examples:

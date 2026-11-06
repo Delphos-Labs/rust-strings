@@ -1,10 +1,10 @@
 [package]
 name = "rust-strings"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 license = "MIT"
 authors = ["Delphos Labs"]
-description = "Streaming ASCII and Unicode UTF-16 string extraction for binary data"
+description = "Streaming ASCII, UTF-8, and UTF-16 string extraction for binary data"
 readme = "README.md"
 documentation = "https://docs.rs/rust-strings"
 repository = "https://github.com/Delphos-Labs/rust-strings"
