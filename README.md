@@ -126,6 +126,20 @@ avoids falsely deleting a valid string based only on alignment.
 
 If any sink callback fails, scanning stops without another sink callback.
 
+### One-byte XOR strings
+
+`Encoding::XorASCII` (`"xor-ascii"` in Python) finds ASCII strings XORed with
+one byte whose zero padding was XORed too. XOR turns that padding into a run of
+the key byte. Each run of 8 or more copies of one non-zero byte is taken as a
+key, and the scanner decodes the bytes before the run while they decode to
+string bytes, back to the end of the previous such run or 512 bytes. Bytes just
+before the string that also decode to text under the key, such as a length
+field, become part of the hit. A hit needs the minimum length and three ASCII
+letters in a row, which rejects instruction padding after code. The hit is
+reported complete, with its key in `HitStart::xor_key`, and takes no part in
+ASCII and UTF-16 suppression. Strings without zero padding after them, keys
+longer than one byte, and strings built in code are out of reach.
+
 ## Contributing
 Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.
 
