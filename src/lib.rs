@@ -34,6 +34,7 @@
 mod encodings;
 mod scanner;
 mod strings;
+mod xor;
 
 pub use encodings::{Encoding, EncodingNotFoundError};
 pub use scanner::{

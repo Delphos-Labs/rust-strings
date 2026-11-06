@@ -27,6 +27,8 @@ struct PyStringHit {
     character_count: u64,
     #[pyo3(get)]
     decoded_utf8_length: u64,
+    #[pyo3(get)]
+    xor_key: Option<u8>,
 }
 
 impl From<RustStringHit> for PyStringHit {
@@ -36,6 +38,7 @@ impl From<RustStringHit> for PyStringHit {
             RustEncoding::UTF8 => "utf-8",
             RustEncoding::UTF16LE => "utf-16le",
             RustEncoding::UTF16BE => "utf-16be",
+            RustEncoding::XorASCII => "xor-ascii",
         };
         Self {
             text: hit.text,
@@ -44,6 +47,7 @@ impl From<RustStringHit> for PyStringHit {
             encoding: encoding.to_owned(),
             character_count: hit.finish.character_count,
             decoded_utf8_length: hit.finish.decoded_utf8_length,
+            xor_key: hit.start.xor_key.map(|key| key.get()),
         }
     }
 }
